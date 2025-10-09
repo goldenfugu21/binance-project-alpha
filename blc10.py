@@ -3,6 +3,7 @@ import asyncio
 import websockets
 import json
 import math
+import concurrent.futures
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, ROUND_CEILING, ROUND_FLOOR
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
@@ -20,7 +21,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 
 
-# --- 로깅 시스템 설정 ---
+# --- 로깅 시스템 설정 (수정) ---
 def setup_logging():
     log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 
@@ -31,7 +32,8 @@ def setup_logging():
     console_handler.setFormatter(log_formatter)
 
     root_logger = logging.getLogger()
-    root_logger.setLevel(logging.INFO)
+    # 📢 [수정] 기본 로깅 레벨을 DEBUG로 설정하여 모든 로그를 볼 수 있도록 합니다.
+    root_logger.setLevel(logging.INFO) 
     root_logger.addHandler(log_handler)
     root_logger.addHandler(console_handler)
 
@@ -80,38 +82,86 @@ class ClickablePriceLabel(QLabel):
         self.clicked.emit(self.text())
 
 
-# --- WebSocket 워커 ---
+# --- WebSocket 워커 (로그 레벨 세분화) ---
 class BinanceWorker(QObject):
     data_received = pyqtSignal(dict)
-    connection_error = pyqtSignal(str)
+    connection_error = pyqtSignal(str) # 연결 오류 시 이 시그널을 통해 재연결 요청
 
     def __init__(self, symbol, websocket_uri):
         super().__init__()
         self.symbol = symbol.lower()
         self.running = False
         self.websocket_uri = f"{websocket_uri}/{self.symbol}@depth5@100ms"
+        self.loop = None 
+        self.listen_task = None 
 
     def run(self):
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        
         self.running = True
-        asyncio.run(self.connect_and_listen())
+        try:
+            # 📢 [로그 수정] Task 생성은 DEBUG 레벨
+            self.listen_task = self.loop.create_task(self.connect_and_listen())
+            logging.debug(f"{self.symbol} WebSocket Task 생성됨.")
+            self.loop.run_forever() 
+        except Exception as e:
+             logging.error(f"WebSocket 스레드 루프 실행 중 치명적인 오류: {e}", exc_info=True)
+        finally:
+            if self.loop.is_running():
+                self.loop.stop()
+            self.loop.close()
+            logging.info(f"{self.symbol} WebSocket 이벤트 루프가 종료되었습니다.")
+
 
     async def connect_and_listen(self):
-        try:
-            async with websockets.connect(self.websocket_uri) as websocket:
-                logging.info(f"{self.symbol} WebSocket에 연결되었습니다.")
-                while self.running:
-                    try:
-                        message = await asyncio.wait_for(websocket.recv(), timeout=10.0)
-                        self.data_received.emit(json.loads(message))
-                    except (asyncio.TimeoutError, websockets.exceptions.ConnectionClosed):
-                        logging.warning(f"{self.symbol} WebSocket 연결 문제 발생, 재연결 시도...")
-                        break
-        except Exception as e:
-            self.connection_error.emit(f"WebSocket 연결 실패: {e}")
-            logging.error(f"WebSocket 연결 실패: {e}", exc_info=True)
+        while self.running:
+            try:
+                async with websockets.connect(self.websocket_uri) as websocket:
+                    logging.info(f"{self.symbol} WebSocket에 연결되었습니다.")
+                    while self.running:
+                        try:
+                            # 10초 타임아웃을 설정하여 연결 활성 상태를 확인
+                            message = await asyncio.wait_for(websocket.recv(), timeout=10.0)
+                            self.data_received.emit(json.loads(message))
+                        except asyncio.TimeoutError:
+                            # 📢 [로그 수정] 정기적인 Ping은 DEBUG 레벨
+                            logging.debug(f"{self.symbol} WebSocket Timeout. Ping 전송.")
+                            await websocket.ping() 
+                            continue 
+                        except websockets.exceptions.ConnectionClosed as e:
+                            logging.warning(f"{self.symbol} WebSocket 연결이 닫혔습니다. 코드: {e.code}, 이유: {e.reason}")
+                            break 
+                        except Exception as e:
+                            if 'coroutine already executing' in str(e):
+                                logging.debug(f"{self.symbol} Task 이미 실행 중 오류 무시.")
+                                break
+                            logging.error(f"{self.symbol} 메시지 수신 중 알 수 없는 오류: {e}")
+                            break 
+            except asyncio.CancelledError:
+                logging.debug(f"{self.symbol} WebSocket 연결/수신 코루틴이 취소되었습니다.")
+                break 
+            except Exception as e:
+                if self.running:
+                    error_msg = f"WebSocket 연결 실패: {e}"
+                    self.connection_error.emit(error_msg)
+                    logging.error(error_msg, exc_info=True)
+                await asyncio.sleep(5) 
+                break 
 
     def stop(self):
-        self.running = False
+        if self.running:
+            self.running = False
+            if self.loop and self.loop.is_running():
+                try:
+                    if self.listen_task:
+                        self.loop.call_soon_threadsafe(self.listen_task.cancel)
+                        logging.debug(f"{self.symbol} WebSocket Task 취소 요청됨.")
+                    
+                    self.loop.call_soon_threadsafe(self.loop.stop) 
+                    logging.debug(f"{self.symbol} asyncio 루프 종료 요청됨.")
+                except Exception as e:
+                    logging.error(f"asyncio.stop 요청 중 오류: {e}", exc_info=True)
 
 
 # --- 핵심 계산 로직 ---
@@ -126,7 +176,7 @@ def calculate_target_price(
     raise ValueError("Position type must be 'long' or 'short'")
 
 
-# --- GUI 애플리케이션 클래스 ---
+# --- GUI 애플리케이션 클래스 (절대값 통일 및 로그 레벨 세분화) ---
 class BinanceCalculatorApp(QWidget):
     def __init__(self):
         super().__init__()
@@ -162,7 +212,12 @@ class BinanceCalculatorApp(QWidget):
         self.latest_order_book_data = {}
         self.leverage_brackets = []
         self.is_retry_scheduled = False
-        self.calculated_target_price_decimal = None  # 👈 [추가]
+        self.calculated_target_price_decimal = None 
+        
+        # 📢 [추가] WebSocket 재연결을 위한 QTimer
+        self.reconnect_timer = QTimer(self)
+        self.reconnect_timer.setSingleShot(True)
+        self.reconnect_timer.timeout.connect(self.start_worker)
 
         self.initUI()
         self.start_worker()
@@ -181,7 +236,7 @@ class BinanceCalculatorApp(QWidget):
     def place_limit_close_order(self):
         """
         현재 포지션 상태를 확인하고, 입력된 가격과 수량으로 LIMIT 청산 주문을 제출합니다.
-        SIDE는 포지션에 따라 자동으로 결정됩니다.
+        SIDE는 포지션에 따라 자동으로 결정되며, 가격은 보수적으로 조정됩니다.
         """
         symbol = self.current_selected_symbol
 
@@ -213,21 +268,35 @@ class BinanceCalculatorApp(QWidget):
 
             price = Decimal(limit_price_text)
 
-            # 👇 [추가] 가격을 틱 사이즈에 맞게 조정하는 코드 한 줄을 추가합니다.
-            adjusted_price = self.adjust_price(price)
-
+            # 📢 [수정] 청산 주문 시 보수적인 가격 조정 로직 적용
+            if self.tick_size > Decimal('0'):
+                if position_side == 'LONG':
+                    # 롱 포지션 청산 (SELL): 가격을 올려야 (CEILING) 보수적
+                    adjusted_price = price.quantize(self.tick_size, rounding=ROUND_CEILING)
+                else:
+                    # 숏 포지션 청산 (BUY): 가격을 내려야 (FLOOR) 보수적
+                    adjusted_price = price.quantize(self.tick_size, rounding=ROUND_FLOOR)
+            else:
+                adjusted_price = price # Tick Size 정보가 없으면 조정하지 않음
+            
             # 4. 청산 수량 결정 (MAX 처리)
             if quantity_text == "MAX":
-                quantity = position_amt.copy_abs()
+                # 📢 [수정] copy_abs() 대신 abs() 사용
+                quantity = abs(position_amt)
             else:
                 quantity = Decimal(quantity_text)
 
             if price <= Decimal('0') or quantity <= Decimal('0'):
                 QMessageBox.warning(self, "주문 오류", "가격과 수량은 0보다 커야 합니다.")
                 return
-            if quantity > position_amt.copy_abs():
+            
+            # 수량도 Step Size에 맞춰 조정합니다. (adjust_quantity는 ROUND_DOWN 사용)
+            adjusted_quantity = self.adjust_quantity(quantity) 
+            
+            # 📢 [수정] copy_abs() 대신 abs() 사용
+            if adjusted_quantity > abs(position_amt):
                 QMessageBox.warning(self, "청산 오류",
-                                    f"청산하려는 수량({quantity.normalize()})이 현재 포지션 수량({position_amt.copy_abs().normalize()})보다 많습니다.")
+                                    f"청산하려는 수량({adjusted_quantity.normalize()})이 현재 포지션 수량({abs(position_amt).normalize()})보다 많습니다.")
                 return
 
             # 5. Binance API 호출
@@ -236,13 +305,13 @@ class BinanceCalculatorApp(QWidget):
                 side=side,
                 type=Client.ORDER_TYPE_LIMIT,
                 timeInForce=Client.TIME_IN_FORCE_GTC,
-                quantity=quantity.normalize(),
-                price=str(adjusted_price),
+                quantity=adjusted_quantity.normalize(), # 조정된 수량 사용
+                price=str(adjusted_price.normalize()), # 조정된 가격 사용
                 # 명시적 청산을 위해 reduceOnly=True를 사용합니다.
                 reduceOnly=True
             )
 
-            logging.info(f"LIMIT 청산 주문 제출 성공 (SIDE: {side}, 수량: {quantity}): {order}")
+            logging.info(f"LIMIT 청산 주문 제출 성공 (SIDE: {side}, 수량: {adjusted_quantity}): {order}")
             QMessageBox.information(
                 self,
                 "주문 성공",
@@ -274,7 +343,7 @@ class BinanceCalculatorApp(QWidget):
                 QMessageBox.information(self, "성공", f"{symbol}의 모든 미체결 주문이 성공적으로 취소되었습니다.")
             else:
                 # API 응답이 성공(200)이 아니더라도 취소 시도가 되었으므로 로그만 남깁니다.
-                logging.info(f"미체결 주문 취소 시도 결과: {result}")
+                logging.debug(f"미체결 주문 취소 시도 결과: {result}")
                 QMessageBox.information(self, "알림", f"{symbol}의 미체결 주문 취소 요청을 완료했습니다. 상세: {result.get('msg', '응답 확인')}")
 
             # 취소 후 상태 새로고침
@@ -336,7 +405,7 @@ class BinanceCalculatorApp(QWidget):
         self.entry_price_input.setValidator(QDoubleValidator(0.0, 1e9, 8))
         self.entry_price_input.setText("0.00")
         self.entry_price_input.textChanged.connect(self.calculate_and_display_target)
-        self.entry_price_input.editingFinished.connect(self.format_entry_price)
+        self.entry_price_input.editingFinished.connect(self.format_entry_price) # ✅ focusOut 시점에만 조정
         entry_price_layout.addWidget(entry_price_label)
         entry_price_layout.addWidget(self.entry_price_input)
         input_form_layout.addLayout(entry_price_layout)
@@ -566,6 +635,9 @@ class BinanceCalculatorApp(QWidget):
 
         self.update_button_style()
         self.calculate_and_display_target()
+        # 📢 [추가] 초기 Target Price 버튼 상태 설정
+        self.place_target_order_button.setEnabled(False)
+
 
     def buffer_order_book_data(self, data):
         self.latest_order_book_data = data
@@ -577,29 +649,50 @@ class BinanceCalculatorApp(QWidget):
     def update_ui_from_buffer(self):
         if self.latest_order_book_data:
             self.update_order_book_ui(self.latest_order_book_data)
+        
+        # 📢 [추가] UI 버퍼 업데이트 시 Target Price 버튼 상태 업데이트
+        self.update_target_button_state()
+
 
     def update_order_book_ui(self, data):
         asks = data.get('a', [])
         bids = data.get('b', [])
+        
+        # [수정] 호가 정보의 틱 사이즈에 맞는 정밀도를 결정합니다.
+        precision = 4 # 기본값 (대부분의 코인이 4-5자리)
+        if self.tick_size > Decimal('0'):
+            precision = max(0, -self.tick_size.as_tuple().exponent) # 소수점 자릿수 계산
+            
+        format_string = f"{{:,.{precision}f}} ({{:.3f}})"
+
         for i, label in enumerate(self.ask_price_labels):
             if i < len(asks):
-                label.setText(f"{Decimal(asks[i][0]):,.4f} ({Decimal(asks[i][1]):.3f})")
+                label.setText(format_string.format(Decimal(asks[i][0]), Decimal(asks[i][1])))
             else:
                 label.setText("N/A")
         for i, label in enumerate(self.bid_price_labels):
             if i < len(bids):
-                label.setText(f"{Decimal(bids[i][0]):,.4f} ({Decimal(bids[i][1]):.3f})")
+                label.setText(format_string.format(Decimal(bids[i][0]), Decimal(bids[i][1])))
             else:
                 label.setText("N/A")
 
     def start_worker(self):
+        # 📢 [수정] 재연결 타이머가 실행 중이면 중지합니다.
+        if self.reconnect_timer.isActive():
+            self.reconnect_timer.stop()
+            
         if self.worker_thread and self.worker_thread.isRunning():
             self.stop_worker()
+            
         ws_uri = self.config.get('API', 'websocket_base_uri')
         self.worker = BinanceWorker(self.current_selected_symbol, ws_uri)
         self.worker_thread = QThread()
         self.worker.moveToThread(self.worker_thread)
+        
+        # 📢 [수정] 스레드 종료 시그널 연결 추가
         self.worker_thread.started.connect(self.worker.run)
+        self.worker_thread.finished.connect(lambda: logging.debug(f"{self.worker.symbol} WebSocket 스레드 종료됨.")) 
+        
         self.worker.data_received.connect(self.buffer_order_book_data)
         self.worker.connection_error.connect(self.handle_connection_error)
         self.worker_thread.start()
@@ -607,21 +700,23 @@ class BinanceCalculatorApp(QWidget):
     def stop_worker(self):
         if self.worker_thread and self.worker_thread.isRunning():
             if self.worker:
-                logging.info(f"{self.worker.symbol} WebSocket 연결을 종료합니다.")
-                self.worker.stop()
-            self.worker_thread.quit()
-            self.worker_thread.wait(2000)
+                logging.info(f"{self.worker.symbol} WebSocket 연결을 종료 요청합니다.")
+                self.worker.stop() # async 루프 Task 취소 및 stop 요청
+                
+            # 📢 [수정] wait() 및 terminate() 호출을 제거합니다. 스레드가 백그라운드에서 스스로 정리되도록 합니다.
+            logging.debug(f"{self.worker.symbol} WebSocket 스레드에 정리 명령만 내렸습니다.") 
 
     def closeEvent(self, event):
         logging.info("애플리케이션을 종료합니다.")
         self.position_timer.stop()
         self.ui_update_timer.stop()
+        self.reconnect_timer.stop() # 📢 [추가] 타이머 중지
         self.stop_worker()
         event.accept()
 
     def retry_position_update(self):
         """2초 후 포지션 정보만 조용히 다시 가져옵니다."""
-        logging.info("누락된 포지션 정보를 자동으로 다시 가져옵니다...")
+        logging.debug("누락된 포지션 정보를 자동으로 다시 가져옵니다...")
         self.update_position_status()
         self.is_retry_scheduled = False
 
@@ -643,10 +738,16 @@ class BinanceCalculatorApp(QWidget):
                 self.open_orders_display.setText(f"현재 {self.current_selected_symbol} 미체결 주문 없음")
                 return
             display_text = ""
+            # [수정] 가격 포맷팅을 위한 precision 계산
+            precision = 2 
+            if self.tick_size > Decimal('0'):
+                precision = max(0, -self.tick_size.as_tuple().exponent)
+            price_format = f",.{precision}f"
+            
             for o in orders:
                 side_color = "red" if o['side'] == 'SELL' else "blue"
                 display_text += (f"<b style='font-size:11pt;'>{o['symbol']} <span style='color:{side_color}';>{o['side']}</span></b><br>"
-                                 f" - <b>가격:</b> ${Decimal(o['price']):,.2f}<br>"
+                                 f" - <b>가격:</b> ${Decimal(o['price']):{price_format}}<br>"
                                  f" - <b>수량:</b> {Decimal(o['origQty'])}<br>"
                                  "--------------------------<br>")
             self.open_orders_display.setHtml(display_text)
@@ -659,12 +760,16 @@ class BinanceCalculatorApp(QWidget):
             positions = self.client.futures_position_information(symbol=self.current_selected_symbol)
             open_positions = [p for p in positions if Decimal(p['positionAmt']) != Decimal('0')]
 
-            # (기존: 자동 재시도 로직은 이미 제거되었다고 가정합니다)
-
             if not open_positions:
                 self.position_display.setText(f"현재 {self.current_selected_symbol} 포지션이 없습니다.")
                 return
 
+            # [추가] 포지션 관련 가격 포맷팅을 위한 precision 계산
+            precision = 2 
+            if self.tick_size > Decimal('0'):
+                precision = max(0, -self.tick_size.as_tuple().exponent)
+            price_format = f",.{precision}f"
+            
             display_text = ""
             for p in open_positions:
                 pnl = Decimal(p['unRealizedProfit'])
@@ -673,15 +778,20 @@ class BinanceCalculatorApp(QWidget):
                 mark_price = Decimal(p['markPrice'])
                 position_side = "LONG" if position_amt > 0 else "SHORT"
                 liq_price = Decimal(p['liquidationPrice'])
+                
+                # 포지션 타입 색상 결정 (이전 요청 유지: LONG=빨강, SHORT=파랑)
+                position_color = "red" if position_side == "LONG" else "blue"
 
                 taker_fee_rate = Decimal(self.config.get('TRADING', 'taker_fee_rate'))
-                position_notional = mark_price * position_amt.copy_abs()
+                # 📢 [수정] copy_abs() 대신 abs() 사용
+                position_notional = mark_price * abs(position_amt)
                 closing_fee = position_notional * taker_fee_rate
 
                 net_pnl = pnl - closing_fee
-                net_color = "green" if net_pnl >= 0 else "red"
+                # 📢 [핵심 수정] nPNL/nROE 색상 로직 적용 (양수: 초록색, 음수: 검정색)
+                net_color = "green" if net_pnl >= Decimal('0') else "black" 
 
-                # 🔑 레버리지 확보 로직 (핵심 수정 부분)
+                # 🔑 레버리지 확보 로직 
                 leverage_str = p.get('leverage')
                 leverage = Decimal('0')
                 net_roe_text = "N/A"
@@ -691,27 +801,33 @@ class BinanceCalculatorApp(QWidget):
                     leverage = Decimal(leverage_str)
                 # 2. API 응답에 없으면: UI 입력값으로 보조
                 elif self.leverage_input.text():
-                    leverage = Decimal(self.leverage_input.text())
-                    logging.warning(f"포지션 leverage 키 누락! UI 입력값 {leverage}x로 nROE 계산 보완.")
+                    try:
+                        leverage = Decimal(self.leverage_input.text())
+                        logging.warning(f"포지션 leverage 키 누락! UI 입력값 {leverage}x로 nROE 계산 보완.")
+                    except:
+                        pass
+
 
                 # nROE 계산
                 if leverage > Decimal('0'):
-                    margin = entry_price * position_amt.copy_abs() / leverage
+                    # 📢 [수정] copy_abs() 대신 abs() 사용
+                    margin = entry_price * abs(position_amt) / leverage
                     if margin != Decimal('0'):
                         net_roe = (net_pnl / margin) * Decimal('100')
                         net_roe_text = f"{net_roe:.2f}%"
                     else:
                         net_roe_text = "0.00%"
                 # ----------------------------------------
-
-                # ... (이후 display_text 구성은 동일)
-                display_text += (f"<b style='font-size:11pt;'>{p['symbol']} ({position_side})</b><br>"
-                                 f" - <b>수익(nPNL):</b> <span style='color:{net_color};'>${net_pnl:,.2f}</span><br>"
-                                 f" - <b>수익률(nROE):</b> <span style='color:{net_color};'>{net_roe_text}</span><br>"
-                                 f" - <b>진입가:</b> ${entry_price:,.2f}<br>"
-                                 f" - <b>시장가:</b> ${mark_price:,.2f}<br>"
-                                 f" - <b>청산가:</b> <span style='color:orange;'>${liq_price:,.2f}</span><br>"
-                                 f" - <b>수량:</b> {position_amt.copy_abs()}<br>"
+                
+                # 포지션 타입에 position_color 적용 및 nPNL/nROE 볼드 처리 유지
+                # 📢 [수정] copy_abs() 대신 abs() 사용
+                display_text += (f"<b style='font-size:11pt;'>{p['symbol']} <span style='color:{position_color};'>({position_side})</span></b><br>"
+                                 f" - <b>수익(nPNL):</b> <span style='color:{net_color};'><b>${net_pnl:,.2f}</b></span><br>"
+                                 f" - <b>수익률(nROE):</b> <span style='color:{net_color};'><b>{net_roe_text}</b></span><br>"
+                                 f" - <b>진입가:</b> ${entry_price:{price_format}}<br>"
+                                 f" - <b>시장가:</b> ${mark_price:{price_format}}<br>"
+                                 f" - <b>청산가:</b> <span style='color:orange;'>${liq_price:{price_format}}</span><br>"
+                                 f" - <b>수량:</b> {abs(position_amt)}<br>"
                                  f"--------------------------<br>")
             self.position_display.setHtml(display_text)
 
@@ -720,24 +836,27 @@ class BinanceCalculatorApp(QWidget):
             self.position_display.setText(f"포지션 정보 로드 실패:\n{e}")
 
     def format_entry_price(self):
+        """
+        [수정] Entry price 입력 필드가 focusOut 될 때만 Tick Size에 맞춰 조정합니다. (ROUND_HALF_UP 사용)
+        """
         try:
             price_str = self.entry_price_input.text()
             if not price_str:
                 return
             price = Decimal(price_str)
-            price_precision = self.symbol_info.get('pricePrecision')
-            if price_precision is not None:
-                quantizer = Decimal('1e-' + str(price_precision))
-                rounded_price = price.quantize(quantizer, rounding=ROUND_HALF_UP)
-                self.entry_price_input.setText(str(rounded_price))
+            
+            if self.tick_size > Decimal('0'):
+                # 입력 종료 시점에만 반올림으로 조정 (ROUND_HALF_UP)
+                adjusted_price = price.quantize(self.tick_size, rounding=ROUND_HALF_UP)
+            else:
+                adjusted_price = price
+                
+            self.entry_price_input.setText(str(adjusted_price.normalize())) 
+            # 📢 [추가] 가격이 조정되었으므로 목표 가격 계산을 다시 트리거합니다.
+            self.calculate_and_display_target() 
+
         except Exception:
             pass
-
-    def adjust_price(self, price: Decimal) -> Decimal:
-        if self.tick_size == Decimal('0'):
-            return price
-        # 가격 조정 시에는 일반적으로 소수점을 내림하여 보수적으로 처리합니다.
-        return price.quantize(self.tick_size, rounding=ROUND_DOWN)
 
     def adjust_quantity(self, quantity: Decimal) -> Decimal:
         if self.step_size == Decimal('0'):
@@ -753,9 +872,9 @@ class BinanceCalculatorApp(QWidget):
                     self.symbol_info = s
                     for f in s['filters']:
                         if f['filterType'] == 'PRICE_FILTER':
-                            self.tick_size = Decimal(f['tickSize'])
-                            # 👇 [추가] 받아온 tick_size를 로그로 출력합니다.
-                            logging.info(f"✅ {self.current_selected_symbol} Tick Size Fetched: {self.tick_size}")
+                            # 👇 [핵심 수정] normalize()를 사용하여 불필요한 후행 0의 정밀도를 제거합니다.
+                            self.tick_size = Decimal(f['tickSize']).normalize() 
+                            logging.debug(f"✅ {self.current_selected_symbol} Tick Size Fetched: {self.tick_size}")
                         if f['filterType'] == 'LOT_SIZE':
                             self.step_size = Decimal(f['stepSize'])
 
@@ -763,7 +882,7 @@ class BinanceCalculatorApp(QWidget):
             if leverage_brackets_data:
                 self.leverage_brackets = leverage_brackets_data[0]['brackets']
                 max_leverage = int(self.leverage_brackets[0]['initialLeverage'])
-                logging.info(
+                logging.debug(
                     f"{self.current_selected_symbol} 정보 로드: Tick Size {self.tick_size}, Step Size {self.step_size}, Max Leverage {max_leverage}x")
                 self.leverage_input.setValidator(QDoubleValidator(1.0, float(max_leverage), 0))
                 self.leverage_label.setToolTip(f"이 종목의 최대 레버리지는 {max_leverage}배입니다.")
@@ -806,65 +925,113 @@ class BinanceCalculatorApp(QWidget):
     def place_order_logic(self, order_type):
         try:
             symbol = self.current_selected_symbol
-            total_quantity = Decimal(self.quantity_input.text())
-            grid_count = int(self.grid_count_input.text())
+            total_quantity_text = self.quantity_input.text()
+            total_quantity = Decimal(total_quantity_text) if total_quantity_text else Decimal('0')
+            grid_count_text = self.grid_count_input.text()
+            grid_count = int(grid_count_text) if grid_count_text else 1
+
             if self.position_type is None:
                 QMessageBox.warning(self, "주문 오류", "포지션 타입을 먼저 선택해주세요.")
+                return
+            if total_quantity <= Decimal('0'):
+                QMessageBox.warning(self, "주문 오류", "총 주문 수량은 0보다 커야 합니다.")
                 return
             if grid_count < 1:
                 QMessageBox.warning(self, "주문 오류", "분할 개수는 1 이상이어야 합니다.")
                 return
-
+                
             if order_type == 'entry':
                 title = "포지션 진입"
-                center_price = self.adjust_price(Decimal(self.entry_price_input.text()))  # [수정] 진입가도 즉시 조정
+                entry_price_text = self.entry_price_input.text()
+                if not entry_price_text:
+                    QMessageBox.warning(self, "주문 오류", "기준 가격을 입력해주세요.")
+                    return
+                # 진입가는 이미 format_entry_price에서 조정되었지만, Decimal로 다시 변환
+                center_price = Decimal(entry_price_text)
                 side = Client.SIDE_BUY if self.position_type == 'long' else Client.SIDE_SELL
             elif order_type == 'target':
                 title = "Target Price Limit"
                 if self.calculated_target_price_decimal is None:
                     QMessageBox.warning(self, "주문 오류", "목표 가격을 먼저 계산해주세요.")
                     return
-                # [수정] 저장된 값을 사용하더라도 만약을 위해 다시 한번 조정합니다.
-                center_price = self.adjust_price(self.calculated_target_price_decimal)
+                # 목표 가격은 calculate_and_display_target에서 이미 보수적으로 조정됨
+                center_price = self.calculated_target_price_decimal 
                 side = Client.SIDE_SELL if self.position_type == 'long' else Client.SIDE_BUY
             else:
                 return
-
+            
             orders_to_place = []
             quantity_per_order = total_quantity / Decimal(grid_count)
-            price_interval = Decimal(self.grid_interval_input.text()) * self.tick_size
+            
+            grid_interval_text = self.grid_interval_input.text()
+            if not grid_interval_text:
+                QMessageBox.warning(self, "주문 오류", "가격 간격(Tick)을 입력해주세요.")
+                return
+            
+            price_interval = Decimal(grid_interval_text) * self.tick_size
 
-            price_precision = self.symbol_info.get('pricePrecision')
             start_offset = -(Decimal(grid_count) - Decimal('1')) / Decimal('2')
             for i in range(grid_count):
                 price_offset = (start_offset + Decimal(i)) * price_interval
                 price = center_price + price_offset
 
-                # [수정] 최종 가격을 API에 보내기 직전에 다시 한번! 확실하게 조정합니다.
-                adjusted_price = self.adjust_price(price)
+                # 📢 [수정] 최종 가격을 API에 보내기 직전에 다시 한번! 확실하게 조정합니다.
+                if self.tick_size > Decimal('0'):
+                    if order_type == 'entry':
+                        if self.position_type == 'long':
+                            # Long 진입 (Buy)은 가격을 낮춰야 (ROUND_DOWN) 유리
+                            adjusted_price = price.quantize(self.tick_size, rounding=ROUND_DOWN)
+                        else:
+                            # Short 진입 (Sell)은 가격을 높여야 (ROUND_CEILING) 유리
+                            adjusted_price = price.quantize(self.tick_size, rounding=ROUND_CEILING)
+                    else:
+                        # 청산 주문(target): calculate_and_display_target에서 이미 보수적 조정됨
+                        # 여기서 다시 한번 보수적 로직을 적용 (redundancy를 통한 안전성 확보)
+                        if self.position_type == 'long':
+                            # 롱 청산 (SELL): 가격을 올림 (CEILING)
+                            adjusted_price = price.quantize(self.tick_size, rounding=ROUND_CEILING)
+                        else:
+                             # 숏 청산 (BUY): 가격을 내림 (FLOOR)
+                            adjusted_price = price.quantize(self.tick_size, rounding=ROUND_FLOOR)
+                else:
+                    adjusted_price = price
+                    
                 adjusted_quantity = self.adjust_quantity(quantity_per_order)
 
-                orders_to_place.append({'price': str(adjusted_price), 'quantity': str(adjusted_quantity)})
+                orders_to_place.append({'price': str(adjusted_price.normalize()), 'quantity': str(adjusted_quantity.normalize())})
 
-            logging.info(f"'{title}' 확인 없이 즉시 실행: {grid_count}개 분할, 총 수량 {total_quantity}")
+            logging.info(f"'{title}' 확인 없이 즉시 실행: {grid_count}개 분할, 총 수량 {total_quantity.normalize()}")
             success_count = 0
             failed_orders = []
             for order in orders_to_place:
+                # 수량이 0이면 건너뜁니다.
+                if Decimal(order['quantity']) <= Decimal('0'):
+                    logging.debug(f"수량 0으로 주문 건너뜀: {order}")
+                    continue
+                    
                 try:
-                    logging.info(
-                        f"🚀 Placing Order: SYMBOL={symbol}, SIDE={side}, QTY={order['quantity']}, PRICE={order['price']}, CURRENT_TICK_SIZE={self.tick_size}")
+                    # reduceOnly 옵션은 target 주문일 때만 사용 (청산 주문)
+                    reduce_only = True if order_type == 'target' else False
+                    
+                    logging.debug(
+                        f"🚀 Placing Order: SYMBOL={symbol}, SIDE={side}, QTY={order['quantity']}, PRICE={order['price']}, ReduceOnly={reduce_only}")
                     self.client.futures_create_order(symbol=symbol, side=side, type=Client.ORDER_TYPE_LIMIT,
-                                                    timeInForce=Client.TIME_IN_FORCE_GTC, quantity=order['quantity'],
-                                                    price=order['price'])
+                                                     timeInForce=Client.TIME_IN_FORCE_GTC, quantity=order['quantity'],
+                                                     price=order['price'], reduceOnly=reduce_only)
                     success_count += 1
                 except Exception as e:
                     failed_orders.append((order, e))
+                    logging.error(f"주문 실패 (가격: {order['price']}, 수량: {order['quantity']}): {e}", exc_info=True)
 
             logging.info(f"주문 결과: {success_count}/{grid_count} 성공.")
             if failed_orders:
-                logging.warning(f"실패한 주문: {failed_orders}")
-            self.manual_refresh_data()
-
+                error_msg = "\n".join([f"가격: {o[0]['price']}, 오류: {str(o[1])}" for o in failed_orders])
+                QMessageBox.warning(self, "부분 주문 실패", f"총 {grid_count}개 중 {success_count}개 성공. 나머지 주문 실패:\n{error_msg}")
+            
+            # 성공한 주문이 하나라도 있으면 UI 새로고침
+            if success_count > 0:
+                self.manual_refresh_data()
+            
         except Exception as e:
             logging.error(f"주문 처리 중 오류 발생: {e}", exc_info=True)
             QMessageBox.critical(self, "오류", f"주문 처리 중 오류가 발생했습니다: {e}")
@@ -878,8 +1045,15 @@ class BinanceCalculatorApp(QWidget):
                 return
 
             positions_summary = "\n".join([f"- {p['symbol']}: {p['positionAmt']}" for p in open_positions])
+            
+            # 📢 [수정] QMessageBox HTML 대신 표준 텍스트로 변경
             msg = (
-                f"## 경고 ##\n\n아래의 모든 포지션을 시장가로 즉시 청산합니다.\n관련된 모든 미체결 주문도 함께 취소됩니다.\n\n{positions_summary}\n\n정말로 실행하시겠습니까?")
+                f"경고!\n\n아래의 모든 포지션을 시장가로 즉시 청산합니다.\n"
+                f"관련된 모든 미체결 주문도 함께 취소됩니다.\n\n"
+                f"--- 청산 포지션 목록 ---\n"
+                f"{positions_summary}\n\n"
+                f"정말로 실행하시겠습니까? (시장가 수수료가 부과됩니다)")
+            
             reply = QMessageBox.question(self, '비상 청산 확인', msg, QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
 
             if reply == QMessageBox.Yes:
@@ -891,11 +1065,11 @@ class BinanceCalculatorApp(QWidget):
                     side = Client.SIDE_SELL if position_amt > 0 else Client.SIDE_BUY
                     quantity = abs(position_amt)
                     try:
-                        # self.client.futures_cancel_all_open_orders(symbol=symbol)
+                        # 청산만 요청하는 경우:
                         self.client.futures_create_order(symbol=symbol, side=side, type=Client.ORDER_TYPE_MARKET,
                                                          quantity=quantity, reduceOnly=True)
                         success_count += 1
-                        logging.info(f"{symbol} 포지션 시장가 청산 주문 제출 완료.")
+                        logging.debug(f"{symbol} 포지션 시장가 청산 주문 제출 완료.")
                     except Exception as e:
                         logging.error(f"{symbol} 포지션 청산 중 오류 발생: {e}", exc_info=True)
                         QMessageBox.critical(self, "청산 오류", f"{symbol} 포지션 청산 중 오류 발생:\n{e}")
@@ -923,12 +1097,18 @@ class BinanceCalculatorApp(QWidget):
             if not self.leverage_input.text() or self.available_balance <= 0:
                 return
             leverage = Decimal(self.leverage_input.text())
-            entry_price = self.best_ask_price if self.position_type != 'short' else self.best_bid_price
+            
+            # 📢 [핵심 수정] Max 수량 계산 시 Entry Price Input을 우선적으로 사용
+            entry_price_text = self.entry_price_input.text()
+            if entry_price_text and Decimal(entry_price_text) > 0:
+                entry_price = Decimal(entry_price_text)
+            else:
+                # Entry Price가 0이거나 없을 경우에만 호가 사용
+                entry_price = self.best_ask_price if self.position_type == 'long' else self.best_bid_price
+                
             if entry_price <= Decimal('0'):
-                if self.entry_price_input.text() and Decimal(self.entry_price_input.text()) > 0:
-                    entry_price = Decimal(self.entry_price_input.text())
-                else:
-                    return
+                self.quantity_input.setText("0")
+                return
 
             max_usdt_value = self.available_balance * leverage
             adjusted_max_usdt_value, effective_leverage = self.get_adjusted_max_notional(max_usdt_value, leverage)
@@ -936,14 +1116,18 @@ class BinanceCalculatorApp(QWidget):
             if int(leverage) != int(effective_leverage):
                 self.leverage_input.setText(str(int(effective_leverage)))
 
-            max_quantity = adjusted_max_usdt_value / entry_price
-            target_quantity = max_quantity * (Decimal(percentage) / Decimal('100'))
-            adjusted_quantity = self.adjust_quantity(target_quantity)
+            if entry_price > Decimal('0'):
+                max_quantity = adjusted_max_usdt_value / entry_price
+                target_quantity = max_quantity * (Decimal(percentage) / Decimal('100'))
+                adjusted_quantity = self.adjust_quantity(target_quantity)
 
-            if adjusted_quantity > 0:
-                self.quantity_input.setText(str(adjusted_quantity))
+                if adjusted_quantity > 0:
+                    self.quantity_input.setText(str(adjusted_quantity.normalize()))
+                else:
+                    self.quantity_input.setText("0")
             else:
                 self.quantity_input.setText("0")
+                
         except Exception as e:
             logging.error(f"수량 계산 슬라이더 오류: {e}", exc_info=True)
             pass
@@ -955,14 +1139,26 @@ class BinanceCalculatorApp(QWidget):
         self.stop_worker()
         self.start_worker()
         self.fetch_symbol_info()
+        self.update_position_status()
+        self.update_open_orders_status()
 
     def handle_connection_error(self, error_message):
-        QMessageBox.critical(self, "연결 오류", f"실시간 데이터 연결에 실패했습니다.\n{error_message}")
+        """[수정] WebSocket 연결 오류 시 자동 재연결을 시도합니다."""
+        logging.error(f"WebSocket 연결 실패! {error_message} 5초 후 재연결 시도합니다.")
+        # 📢 [핵심 수정] QTimer를 이용해 5초 후 start_worker 재호출
+        if not self.reconnect_timer.isActive():
+            self.reconnect_timer.start(5000) 
+            QMessageBox.critical(self, "연결 오류", f"실시간 데이터 연결에 실패했습니다.\n{error_message}\n5초 후 자동 재연결을 시도합니다.")
 
     def on_order_book_price_clicked(self, label_text: str):
         try:
+            # 포맷팅된 문자열에서 가격 부분만 추출
             price_str = label_text.split(' ')[0].replace(',', '')
+            # 수량 부분 제외 (괄호로 묶여 있음)
+            price_str = price_str.split('(')[0].strip()
             self.entry_price_input.setText(price_str)
+            self.format_entry_price() # 👈 [수정] 클릭된 가격을 틱 사이즈에 맞춰 즉시 조정/표시
+
         except (ValueError, IndexError):
             pass
 
@@ -984,11 +1180,27 @@ class BinanceCalculatorApp(QWidget):
         else:
             self.long_button.setStyleSheet(default_style)
             self.short_button.setStyleSheet(default_style)
+        
+        # 📢 [추가] 포지션 타입 변경 시 Target Price 버튼 상태 업데이트
+        self.update_target_button_state()
+
+    def update_target_button_state(self):
+        """Target Price Limit 버튼 활성화/비활성화 로직"""
+        is_ready = (
+            self.position_type is not None and
+            self.calculated_target_price_decimal is not None and
+            self.calculated_target_price_decimal > Decimal('0')
+        )
+        self.place_target_order_button.setEnabled(is_ready)
+
 
     def calculate_and_display_target(self):
         try:
             if not all([self.entry_price_input.text(), self.leverage_input.text(), self.roi_input.text()]):
+                self.calculated_target_price_decimal = None
+                self.update_target_button_state()
                 return
+            
             entry_price = Decimal(self.entry_price_input.text())
             leverage = Decimal(self.leverage_input.text())
             target_roi_percent = Decimal(self.roi_input.text())
@@ -1000,16 +1212,20 @@ class BinanceCalculatorApp(QWidget):
             if self.position_type is None:
                 self.target_price_label.setText("Target Price: N/A")
                 self.price_change_label.setText("NLV: N/A")
+                self.calculated_target_price_decimal = None
+                self.update_target_button_state()
                 return
             if entry_price <= Decimal('0') or leverage <= Decimal('0'):
                 self.target_price_label.setText("유효한 값을 입력하세요.")
                 self.price_change_label.setText("NLV: N/A")
+                self.calculated_target_price_decimal = None
+                self.update_target_button_state()
                 return
 
             target_price = calculate_target_price(entry_price, leverage, target_roi_percent, self.position_type,
                                                   fee_rate)
 
-            # --- [수정] 포지션에 따라 보수적으로 가격을 조정하는 로직 ---
+            # --- [핵심 수정] 포지션에 따라 보수적으로 가격을 조정하는 로직 및 가격 표시 정밀도 변경 ---
             if self.tick_size > Decimal('0'):
                 if self.position_type == 'long':
                     # 롱 포지션(매도 목표)은 소수점을 올림(CEILING)하여 더 높은 가격으로 설정
@@ -1018,14 +1234,26 @@ class BinanceCalculatorApp(QWidget):
                     # 숏 포지션(매수 목표)은 소수점을 내림(FLOOR)하여 더 낮은 가격으로 설정
                     rounding_mode = ROUND_FLOOR
 
+                # 가격을 틱 사이즈에 맞게 양자화 (조정)
                 adjusted_target_price = target_price.quantize(self.tick_size, rounding=rounding_mode)
+                
+                # 👇 [수정된 부분] tick_size를 이용하여 포맷팅 정밀도(precision)를 계산
+                # 예: tick_size='0.01' -> precision=2, tick_size='1.0' -> precision=0
+                precision = max(0, -self.tick_size.as_tuple().exponent) 
             else:
+                # tick_size 정보가 없는 경우 (예외 상황), 계산된 가격을 그대로 사용
                 adjusted_target_price = target_price
+                precision = self.symbol_info.get('pricePrecision', 2)
+                
             # -----------------------------------------------------------
 
             self.calculated_target_price_decimal = adjusted_target_price
-            price_precision = self.symbol_info.get('pricePrecision', 2)
-            self.target_price_label.setText(f"Target Price: ${adjusted_target_price:,.{price_precision}f}")
+            
+            # 👇 [수정된 부분] 계산된 정밀도(precision)와 Decimal.normalize()를 사용하여 포맷팅합니다.
+            price_format_string = f"{{:,.{precision}f}}"
+            
+            # 최종 표시 문자열 생성
+            self.target_price_label.setText(f"Target Price: ${price_format_string.format(adjusted_target_price)}")
 
             required_change_percent = (target_roi_percent / leverage) + (fee_rate * Decimal('100'))
             if self.position_type == 'long':
@@ -1036,9 +1264,16 @@ class BinanceCalculatorApp(QWidget):
                 sign = "-"
             html_text = (f"NLV: <b style='color:{color};'>{sign}{required_change_percent:.2f}%</b>")
             self.price_change_label.setText(html_text)
-        except Exception:
+            
+            # 📢 [추가] 계산 성공 후 버튼 상태 업데이트
+            self.update_target_button_state()
+
+        except Exception as e:
+            logging.error(f"목표 가격 계산/표시 오류: {e}", exc_info=True)
             self.target_price_label.setText("Target Price: N/A")
             self.price_change_label.setText("NLV: N/A")
+            self.calculated_target_price_decimal = None
+            self.update_target_button_state()
 
 
 if __name__ == "__main__":
