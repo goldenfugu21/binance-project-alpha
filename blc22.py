@@ -6,6 +6,10 @@ import math
 import os
 import configparser
 import logging
+import pyotp
+import smtplib
+import random
+from email.message import EmailMessage
 from logging.handlers import RotatingFileHandler
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, ROUND_CEILING, ROUND_FLOOR
 
@@ -13,39 +17,33 @@ from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QComboBox, QMessageBox, QGroupBox, QTextEdit,
     QRadioButton, QSlider, QGridLayout, QSplashScreen, 
-    QDesktopWidget, QShortcut 
+    QDesktopWidget, QShortcut, QDialog
 )
-from PyQt5.QtGui import QFont, QDoubleValidator, QCursor, QPixmap, QKeySequence 
+from PyQt5.QtGui import QFont, QDoubleValidator, QCursor, QPixmap, QKeySequence, QIcon
 from PyQt5.QtCore import (
     Qt, QObject, pyqtSignal, QThread, QTimer, QCoreApplication,
-    QPropertyAnimation, QEasingCurve 
+    QPropertyAnimation, QEasingCurve, QUrl, QSize
 )
+from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
 
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
-# 'config' 모듈이 있어야 API KEY와 SECRET KEY를 가져올 수 있습니다.
-# 이 파일을 실행하는 디렉토리에 config.py 파일이 필요합니다.
-try:
-    import config 
-except ImportError:
-    # config.py가 없는 경우 로깅을 통해 사용자에게 알림
-    print("경고: 'config.py' 파일을 찾을 수 없습니다. API 연동 기능이 동작하지 않을 수 있습니다.")
-    class DummyConfig:
-        API_KEY = "YOUR_API_KEY"
-        SECRET_KEY = "YOUR_SECRET_KEY"
-    config = DummyConfig()
+
+# --- 유틸리티 파일 임포트 ---
+# 이 파일들이 없으면 프로그램이 시작되지 않는 것이 정상입니다.
+from password_util import verify_password
+from crypto_util import decrypt_data
+
+BASE_DIR = os.path.dirname(os.path.abspath(sys.argv[0]))
 
 
 # --- 로깅 시스템 설정 ---
 def setup_logging():
     log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-
-    log_handler = RotatingFileHandler('trading_app.log', maxBytes=5 * 1024 * 1024, backupCount=3, encoding='utf-8')
+    log_handler = RotatingFileHandler(os.path.join(BASE_DIR, 'trading_app.log'), maxBytes=5 * 1024 * 1024, backupCount=3, encoding='utf-8')
     log_handler.setFormatter(log_formatter)
-
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(log_formatter)
-
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.INFO)
     root_logger.addHandler(log_handler)
@@ -55,27 +53,16 @@ def setup_logging():
 # --- 설정 파일 관리 ---
 def create_default_config():
     config_obj = configparser.ConfigParser()
-    config_obj['API'] = {
-        'api_url': 'https://fapi.binance.com/fapi',
-        'websocket_base_uri': 'wss://fstream.binance.com/ws'
-    }
-    config_obj['TRADING'] = {
-        'default_symbol': 'BTCUSDT',
-        'symbols': 'BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT',
-        'maker_fee_rate': '0.0002',
-        'taker_fee_rate': '0.0004'
-    }
-    config_obj['APP_SETTINGS'] = {
-        'position_update_interval_ms': '2000',
-        'ui_update_interval_ms': '100'
-    }
-    with open('config.ini', 'w', encoding='utf-8') as configfile:
+    config_obj['API'] = {'api_url': 'https://fapi.binance.com/fapi', 'websocket_base_uri': 'wss://fstream.binance.com/ws'}
+    config_obj['TRADING'] = {'default_symbol': 'BTCUSDT', 'symbols': 'BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT', 'maker_fee_rate': '0.0002', 'taker_fee_rate': '0.0004'}
+    config_obj['APP_SETTINGS'] = {'position_update_interval_ms': '2000', 'ui_update_interval_ms': '100'}
+    with open(os.path.join(BASE_DIR, 'config.ini'), 'w', encoding='utf-8') as configfile:
         config_obj.write(configfile)
     logging.info("기본 'config.ini' 파일이 생성되었습니다.")
 
 
 # --- 단축키 설정 파일 관리 ---
-def load_shortcuts(filename='shortcuts.json'):
+def load_shortcuts(filename=os.path.join(BASE_DIR, 'shortcuts.json')):
     if os.path.exists(filename):
         try:
             with open(filename, 'r', encoding='utf-8') as f:
@@ -89,42 +76,52 @@ def load_shortcuts(filename='shortcuts.json'):
         return create_default_shortcuts(write_file=True)
 
 def create_default_shortcuts(write_file=True):
-    default_shortcuts = {
-        "Market_Close": "Ctrl+Shift+E",
-        "Cancel_All_Orders": "Ctrl+Shift+Z",
-        "Limit_Exit": "Ctrl+Shift+X",
-        "Place_Entry_Order": "Ctrl+Alt+Q",
-        "Place_Target_Order": "Ctrl+Alt+W",
-        "Refresh_Data": "F5"
-    }
-    
+    default_shortcuts = {"Market_Close": "Ctrl+Shift+E", "Cancel_All_Orders": "Ctrl+Shift+Z", "Limit_Exit": "Ctrl+Shift+X", "Place_Entry_Order": "Ctrl+Alt+Q", "Place_Target_Order": "Ctrl+Alt+W", "Refresh_Data": "F5"}
     if write_file:
         try:
-            with open('shortcuts.json', 'w', encoding='utf-8') as f:
+            with open(os.path.join(BASE_DIR, 'shortcuts.json'), 'w', encoding='utf-8') as f:
                 json.dump(default_shortcuts, f, ensure_ascii=False, indent=4)
             logging.info("기본 'shortcuts.json' 파일이 생성되었습니다.")
         except Exception as e:
             logging.error(f"기본 'shortcuts.json' 파일 생성 실패: {e}")
-            
     return default_shortcuts
+
+
+# --- Gmail 이메일 발송 함수 ---
+def send_verification_email(receiver_email):
+    verification_code = str(random.randint(100000, 999999))
+    SMTP_SERVER = "smtp.gmail.com"
+    SMTP_PORT = 587
+    SENDER_EMAIL = "0tlswogur@gmail.com"
+    SENDER_PASSWORD = "szqjugnhieaoitir"
+    msg = EmailMessage()
+    msg["Subject"] = "Binance Station Alpha 인증번호"
+    msg["From"] = SENDER_EMAIL
+    msg["To"] = receiver_email
+    msg.set_content(f"인증번호: {verification_code}")
+    try:
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as smtp:
+            smtp.starttls()
+            smtp.login(SENDER_EMAIL, SENDER_PASSWORD)
+            smtp.send_message(msg)
+        logging.info(f"인증번호 {verification_code}를 {receiver_email}로 발송했습니다.")
+        return verification_code
+    except Exception as e:
+        logging.error(f"이메일 발송 실패: {e}")
+        return None
 
 
 # --- 스플래시 스크린 관리 클래스 ---
 class SplashManager(QObject):
     def __init__(self, parent=None, image_path="splash_boot.png"):
         super().__init__(parent)
-        
-        base_dir = os.path.dirname(sys.argv[0]) 
-        self.full_image_path = os.path.join(base_dir, image_path)
-        
+        self.full_image_path = os.path.join(BASE_DIR, image_path)
         self.splash = None
         self.is_ready = False
         self.pixmap = None
         self.animation = None
-        
         try:
             self.pixmap = QPixmap(self.full_image_path)
-            
             if self.pixmap.isNull():
                 logging.error(f"스플래시 이미지 로드 실패: 절대 경로({self.full_image_path})를 확인하세요.")
             else:
@@ -133,32 +130,24 @@ class SplashManager(QObject):
             logging.error(f"스플래시 초기화 중 오류: {e}")
 
     def show_splash(self):
-        if not self.is_ready:
-            return
-        
+        if not self.is_ready: return
         self.splash = QSplashScreen(self.pixmap)
         screen_geometry = QApplication.desktop().screenGeometry()
         x = (screen_geometry.width() - self.pixmap.width()) // 2
         y = (screen_geometry.height() - self.pixmap.height()) // 2
         self.splash.move(x, y)
-        
         self.animation = QPropertyAnimation(self.splash, b"windowOpacity")
-        self.animation.setDuration(400) 
+        self.animation.setDuration(400)
         self.animation.setStartValue(0.0)
         self.animation.setEndValue(1.0)
         self.animation.setEasingCurve(QEasingCurve.InQuad)
-        
         self.splash.setWindowOpacity(0.0)
         self.splash.show()
-        self.animation.start() 
+        self.animation.start()
         
     def hide_splash(self, main_window=None, duration_ms=0):
-        if not self.is_ready or not self.splash:
-            return
-            
-        if self.animation and self.animation.state() == QPropertyAnimation.Running:
-            self.animation.stop() 
-        
+        if not self.is_ready or not self.splash: return
+        if self.animation and self.animation.state() == QPropertyAnimation.Running: self.animation.stop()
         if duration_ms > 0:
             QTimer.singleShot(duration_ms, lambda: self._finalize_hide(main_window))
         else:
@@ -166,17 +155,144 @@ class SplashManager(QObject):
             
     def _finalize_hide(self, main_window):
         if self.splash:
-            if main_window:
-                self.splash.finish(main_window)
+            if main_window: self.splash.finish(main_window)
             else:
                 self.splash.close()
                 self.splash.deleteLater()
 
 
+# --- 로그인 다이얼로그 클래스 ---
+class LoginDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Binance Station Alpha v1.0")
+        self.setFixedSize(300, 120)
+        
+        self.auth_stage = 0  # 0: 비밀번호, 1: OTP, 2: 이메일
+        self.sent_email_code = None
+        self.user_email = ""
+        self.client = None
+
+        layout = QGridLayout()
+        self.setLayout(layout)
+
+        # 위젯 생성
+        self.id_label = QLabel("아이디:")
+        self.id_input = QLineEdit(self)
+        self.pw_label = QLabel("비밀번호:")
+        self.password_input = QLineEdit(self)
+        self.password_input.setEchoMode(QLineEdit.Password)
+
+        self.login_button = QPushButton("다음", self)
+        self.message_label = QLabel("", self)
+
+        # 레이아웃에 위젯 추가
+        layout.addWidget(self.id_label, 0, 0)
+        layout.addWidget(self.id_input, 0, 1)
+        layout.addWidget(self.pw_label, 1, 0)
+        layout.addWidget(self.password_input, 1, 1)
+        layout.addWidget(self.login_button, 2, 0, 1, 2)
+        layout.addWidget(self.message_label, 3, 0, 1, 2)
+        
+        # --- 시그널 연결 정리 ---
+        self.login_button.clicked.connect(self._handle_login)
+        # 초기에는 비밀번호 입력창에서만 엔터 키가 동작하도록 연결
+        self.password_input.returnPressed.connect(self._handle_login)
+
+    def _handle_login(self):
+        if self.auth_stage == 0: self._verify_password()
+        elif self.auth_stage == 1: self._verify_otp()
+        elif self.auth_stage == 2: self._verify_email_code()
+
+    def _verify_password(self):
+        correct_id = "goldenfugu21"
+        self.user_email = "0tlswogur@gmail.com"
+        correct_password_hash = b'\xfe\xa4\x1d\xd1\xfd\xb4^l\xadC\xf8A\xc6\xaa\xa7x`|\x8f\x1akd\x855E\x92\xb1|JO*\x80\r_Yz\xdbt\x9cF\x89N\x08A\xc2\x13\x0f\xbd[f\x1b|\x06\rm\xe8\x11\xc3\xf2]H\r\x0b\x1d'
+        
+        if self.id_input.text() == correct_id and verify_password(correct_password_hash, self.password_input.text()):
+            self._switch_to_otp_stage()
+        else:
+            self.message_label.setStyleSheet("color: red;")
+            self.message_label.setText("아이디 또는 비밀번호가 틀렸습니다.")
+
+    def _switch_to_otp_stage(self):
+        self.auth_stage = 1
+        self.setWindowTitle("OTP 인증")
+        self.id_label.setText("OTP 코드:")
+        self.id_input.clear()
+        self.id_input.setPlaceholderText("6자리 코드를 입력하세요")
+        self.pw_label.hide()
+        self.password_input.hide()
+        self.login_button.setText("다음")
+        self.message_label.setText("")
+        self.id_input.setFocus()
+
+        # --- 엔터 키 시그널 재설정 ---
+        self.password_input.returnPressed.disconnect()
+        self.id_input.returnPressed.connect(self._handle_login)
+
+    def _verify_otp(self):
+        if not self.id_input.text(): return
+        secret_key = "GOZTUG45MBOGODWSBTEC55O7WV7S2DYW"
+        totp = pyotp.TOTP(secret_key)
+        if totp.verify(self.id_input.text()):
+            self.message_label.setStyleSheet("color: black;")
+            self.message_label.setText("이메일을 발송 중입니다...")
+            QApplication.processEvents()
+            self.sent_email_code = send_verification_email(self.user_email)
+            if self.sent_email_code:
+                self._switch_to_email_stage()
+            else:
+                self.message_label.setStyleSheet("color: red;")
+                self.message_label.setText("이메일 발송에 실패했습니다.")
+        else:
+            self.message_label.setStyleSheet("color: red;")
+            self.message_label.setText("OTP 코드가 올바르지 않습니다.")
+
+    def _switch_to_email_stage(self):
+        self.auth_stage = 2
+        self.setWindowTitle("이메일 인증")
+        self.id_label.setText("인증번호:")
+        self.id_input.clear()
+        self.id_input.setPlaceholderText("이메일로 받은 6자리 숫자")
+        self.login_button.setText("로그인")
+        self.message_label.setStyleSheet("color: black;")
+        self.message_label.setText(f"이메일로 인증번호를 보냈습니다.")
+        self.id_input.setFocus()
+
+    def _verify_email_code(self):
+        if not self.id_input.text(): return
+        if self.id_input.text() == self.sent_email_code:
+            try:
+                self.message_label.setStyleSheet("color: black;")
+                self.message_label.setText("API 키 복호화 및 연결 시도 중...")
+                QApplication.processEvents()
+                enc_api_key = os.environ.get('ENC_BINANCE_API_KEY')
+                enc_secret_key = os.environ.get('ENC_BINANCE_SECRET_KEY')
+                if not enc_api_key or not enc_secret_key:
+                    raise ValueError("환경 변수에서 API 키를 찾을 수 없습니다.")
+                password = self.password_input.text()
+                self.password_input.clear() # 비밀번호 입력창 즉시 초기화 (보안 강화)
+                self.password_input.hide()  # 숨겨서 재입력 방지
+                self.pw_label.hide()
+                api_key = decrypt_data(enc_api_key.encode(), password)
+                secret_key = decrypt_data(enc_secret_key.encode(), password)
+                client = Client(api_key, secret_key)
+                client.futures_ping()
+                self.client = client
+                self.accept()
+            except Exception as e:
+                logging.error(f"API 키 복호화 또는 연결 실패: {e}")
+                self.message_label.setStyleSheet("color: red;")
+                self.message_label.setText("API 키 복호화 또는 연결에 실패했습니다.")
+        else:
+            self.message_label.setStyleSheet("color: red;")
+            self.message_label.setText("인증번호가 올바르지 않습니다.")
+
+
 # --- 커스텀 라벨 클래스 ---
 class ClickablePriceLabel(QLabel):
     clicked = pyqtSignal(str)
-
     def __init__(self, text, color, parent=None):
         super().__init__(text, parent)
         self.color = color
@@ -190,7 +306,6 @@ class ClickablePriceLabel(QLabel):
             }}
             QLabel:hover {{ background-color: #F0F0F0; }}
         """)
-
     def mousePressEvent(self, event):
         self.clicked.emit(self.text())
 
@@ -199,17 +314,14 @@ class ClickablePriceLabel(QLabel):
 class BinanceWorker(QObject):
     data_received = pyqtSignal(dict)
     connection_error = pyqtSignal(str)
-
     def __init__(self, symbol, websocket_uri):
         super().__init__()
         self.symbol = symbol.lower()
         self.running = False
         self.websocket_uri = f"{websocket_uri}/{self.symbol}@depth5@100ms"
-
     def run(self):
         self.running = True
         asyncio.run(self.connect_and_listen())
-
     async def connect_and_listen(self):
         try:
             async with websockets.connect(self.websocket_uri) as websocket:
@@ -226,7 +338,6 @@ class BinanceWorker(QObject):
         except Exception as e:
             self.connection_error.emit(f"WebSocket 연결 실패: {e}")
             logging.error(f"WebSocket 연결 실패: {e}", exc_info=True)
-
     def stop(self):
         self.running = False
 
@@ -245,27 +356,31 @@ def calculate_target_price(
 
 # --- GUI 애플리케이션 클래스 ---
 class BinanceCalculatorApp(QWidget):
-    def __init__(self):
+    def __init__(self, client): # <<< client를 인자로 받도록 수정
         super().__init__()
 
-        self.config = configparser.ConfigParser()
-        if not self.config.read('config.ini', encoding='utf-8'):
-            logging.error("config.ini 파일을 읽을 수 없습니다. 기본 설정이 필요합니다.")
-
-        self.setWindowTitle("Binance Station Alpha V1.0 (Live landscape Mode)")
+        self.client = client # <<< 전달받은 client 객체 사용
         
+        self.config = configparser.ConfigParser()
+        # ... (config.ini 읽는 부분은 동일) ...
+
+        config_path = os.path.join(BASE_DIR, 'config.ini')
+        if not self.config.read(config_path, encoding='utf-8'):
+            logging.error(f"{config_path} 파일을 읽을 수 없습니다. 기본 설정이 필요합니다.")
+
+        self.setWindowTitle("Binance Station Alpha v1.0")
         self.resize(820, 640) 
         self.center()
 
-        try:
-            self.client = Client(config.API_KEY, config.SECRET_KEY)
-            self.client.API_URL = self.config.get('API', 'api_url')
-            self.client.futures_ping()
-            logging.info("바이낸스 실제 서버 클라이언트 초기화 성공.")
-        except Exception as e:
-            logging.critical(f"API 연결 실패: {e}", exc_info=True)
-            QMessageBox.critical(self, "API 연결 실패", f"API 키 또는 연결을 확인해주세요.\n오류: {e}")
-            QCoreApplication.quit()
+        #try:
+        #    self.client = Client(config.API_KEY, config.SECRET_KEY)
+        #    self.client.API_URL = self.config.get('API', 'api_url')
+        #    self.client.futures_ping()
+        #    logging.info("바이낸스 실제 서버 클라이언트 초기화 성공.")
+        #except Exception as e:
+        #    logging.critical(f"API 연결 실패: {e}", exc_info=True)
+        #    QMessageBox.critical(self, "API 연결 실패", f"API 키 또는 연결을 확인해주세요.\n오류: {e}")
+        #    QCoreApplication.quit()
             
         self.current_selected_symbol = self.config.get('TRADING', 'default_symbol')
         self.position_type = None
@@ -284,7 +399,7 @@ class BinanceCalculatorApp(QWidget):
         self.calculated_ntp_decimal = None
         
         try:
-             self.shortcuts = load_shortcuts()
+             self.shortcuts = load_shortcuts(filename=os.path.join(BASE_DIR, 'shortcuts.json'))
         except Exception as e:
              logging.error(f"shortcuts.json 파일 로드 실패: {e}")
              self.shortcuts = {} 
@@ -302,6 +417,128 @@ class BinanceCalculatorApp(QWidget):
         self.ui_update_timer = QTimer(self)
         self.ui_update_timer.timeout.connect(self.update_ui_from_buffer)
         self.ui_update_timer.start(self.config.getint('APP_SETTINGS', 'ui_update_interval_ms'))
+
+    # --- 🔽 1단계: 아래 함수 전체를 클래스 내부에 추가 🔽 ---
+
+    def set_super_max_quantity(self):
+        """SuperMax 버튼 클릭 시 실행될 함수. '반올림'을 사용하여 최대 수량을 계산합니다."""
+        try:
+            # 기존 update_quantity_from_slider와 로직은 동일
+            percentage = 100  # SuperMax는 무조건 100%
+            self.slider_label.setText(f"{percentage}%")
+            self.quantity_slider.setValue(percentage) # 슬라이더도 100으로 동기화
+
+            if not self.leverage_input.text() or self.available_balance <= 0: return
+
+            leverage = Decimal(self.leverage_input.text())
+            entry_price = self.best_ask_price if self.position_type != 'short' else self.best_bid_price
+            if entry_price <= Decimal('0'):
+                if self.entry_price_input.text() and Decimal(self.entry_price_input.text()) > 0:
+                    entry_price = Decimal(self.entry_price_input.text())
+                else:
+                    return
+
+            max_usdt_value = self.available_balance * leverage
+            adjusted_max_usdt_value, effective_leverage = self.get_adjusted_max_notional(max_usdt_value, leverage)
+
+            if int(leverage) != int(effective_leverage):
+                self.leverage_input.setText(str(int(effective_leverage)))
+
+            if entry_price > Decimal('0'):
+                max_quantity = adjusted_max_usdt_value / entry_price
+                target_quantity = max_quantity * (Decimal(percentage) / Decimal('100'))
+                
+                # --- ✨ 여기가 핵심! 'ROUND_HALF_UP' (반올림) 사용 ---
+                if self.step_size > Decimal('0'):
+                    super_max_quantity = target_quantity.quantize(self.step_size, rounding=ROUND_HALF_UP)
+                else:
+                    super_max_quantity = target_quantity
+                # --- ✨ ---
+
+                self.quantity_input.setText(str(super_max_quantity.normalize()) if super_max_quantity > 0 else "0")
+            else:
+                self.quantity_input.setText("0")
+
+        except Exception as e:
+            logging.error(f"SuperMax 수량 계산 오류: {e}", exc_info=True)
+            QMessageBox.warning(self, "계산 오류", f"SuperMax 수량 계산 중 오류가 발생했습니다:\n{e}")
+
+    def update_daily_pnl(self):
+        try:
+            start_asset_text = self.start_asset_input.text()
+            if not start_asset_text:
+                start_asset = Decimal('0')
+            else:
+                start_asset = Decimal(start_asset_text)
+
+            # 자산 현황 패널의 제목에서 현재 총자산 값을 파싱
+            title = self.asset_group_box.title() # "자산 현황 (총: $12,345.67 USDT)"
+            current_asset_str = title.split('$')[1].split(' ')[0].replace(',', '')
+            current_asset = Decimal(current_asset_str)
+
+            if start_asset > 0:
+                pnl_amount = current_asset - start_asset
+                pnl_percent = (pnl_amount / start_asset) * 100
+
+                # xROE(수익률) 라벨 업데이트
+                color = "green" if pnl_percent >= 0 else "blue"
+                sign = "+" if pnl_percent >= 0 else ""
+                self.daily_pnl_label.setText(f"xROE: <b style='color:{color};'>{sign}{pnl_percent:.2f}%</b>")
+
+                # xPNL(손익) 금액 라벨 업데이트
+                color = "green" if pnl_amount >= 0 else "blue"
+                sign = "+" if pnl_amount >= 0 else ""
+                self.daily_pnl_amount_label.setText(f"xPNL: <b style='color:{color};'>{sign}${pnl_amount:,.2f}</b>")
+            else:
+                # 시작 자산이 0이면 초기 상태로 표시
+                self.daily_pnl_label.setText("xROE: 0.00%")
+                self.daily_pnl_amount_label.setText("xPNL: $0.00")
+
+        except (IndexError, ValueError, TypeError):
+            # 파싱 실패 또는 계산 오류 시 초기 상태로 표시
+            self.daily_pnl_label.setText("xROE: 계산 오류")
+            self.daily_pnl_amount_label.setText("xPNL: -")
+
+    def update_slider_from_quantity(self):
+        # 무한 루프 방지를 위해 슬라이더의 신호를 일시적으로 끊음
+        self.quantity_slider.blockSignals(True)
+        
+        try:
+            # 최대 구매 가능 수량 계산 (기존 로직 재사용)
+            leverage = Decimal(self.leverage_input.text())
+            entry_price = self.best_ask_price if self.position_type != 'short' else self.best_bid_price
+            if entry_price <= Decimal('0'):
+                if self.entry_price_input.text() and Decimal(self.entry_price_input.text()) > 0:
+                    entry_price = Decimal(self.entry_price_input.text())
+                else:
+                    self.quantity_slider.blockSignals(False)
+                    return
+
+            max_usdt_value = self.available_balance * leverage
+            if entry_price > Decimal('0'):
+                max_quantity = max_usdt_value / entry_price
+            else:
+                max_quantity = Decimal('0')
+
+            # 현재 입력된 수량을 최대 수량 대비 퍼센트로 변환
+            current_quantity_text = self.quantity_input.text()
+            if current_quantity_text and max_quantity > Decimal('0'):
+                current_quantity = Decimal(current_quantity_text)
+                percentage = (current_quantity / max_quantity) * 100
+                
+                # --- ▼▼▼ 이 부분에 라벨 업데이트 코드 추가 ▼▼▼ ---
+                slider_value = int(max(0, min(100, percentage)))
+                self.quantity_slider.setValue(slider_value)
+                self.slider_label.setText(f"{slider_value}%") # <<< 추가
+                # --- ▲▲▲ 수정 끝 ▲▲▲ ---
+            else:
+                self.quantity_slider.setValue(0)
+                self.slider_label.setText("0%") # <<< 추가
+        except (ValueError, TypeError):
+            self.quantity_slider.setValue(0)
+            self.slider_label.setText("0%") # <<< 추가
+        finally:
+            self.quantity_slider.blockSignals(False)
         
         
     def center(self):
@@ -405,16 +642,22 @@ class BinanceCalculatorApp(QWidget):
             QMessageBox.critical(self, "오류", f"주문 전체 취소 중 오류 발생: {e}")
 
     def initUI(self):
-        self.resize(820, 640) 
+        self.resize(820, 640)  
         self.center()
 
-        grid = QGridLayout()
-        self.setLayout(grid)
+        # 1. 메인 그리드 레이아웃 생성
+        main_grid = QGridLayout()
+        self.setLayout(main_grid)
+        
+        # 폰트 및 기본 설정
         label_font = QFont("Arial", 10)
         input_font = QFont("Arial", 10)
         result_font = QFont("Arial", 14, QFont.Bold)
         button_font = QFont("Arial", 10, QFont.Bold)
         
+        # --- 2. 각 열(Column) 위젯 생성 ---
+
+        # === Column 0 (좌측) 위젯들 ===
         manual_limit_group_box = QGroupBox("Limit Exit Order")
         limit_layout = QGridLayout()
         limit_layout.addWidget(QLabel("Price:"), 0, 0)
@@ -426,7 +669,7 @@ class BinanceCalculatorApp(QWidget):
         self.limit_quantity_input = QLineEdit(self)
         self.limit_quantity_input.setPlaceholderText("청산할 수량 입력 (전량은 'MAX')")
         self.limit_quantity_input.setValidator(QDoubleValidator(0.00, 1000000.00, 8))
-        self.limit_quantity_input.setText("MAX") 
+        self.limit_quantity_input.setText("MAX")
         limit_layout.addWidget(self.limit_quantity_input, 1, 1)
         self.limit_close_button = QPushButton("LIMIT", self)
         self.limit_close_button.setFont(button_font)
@@ -434,7 +677,6 @@ class BinanceCalculatorApp(QWidget):
         self.limit_close_button.clicked.connect(self.place_limit_close_order)
         limit_layout.addWidget(self.limit_close_button, 2, 0, 1, 2)
         manual_limit_group_box.setLayout(limit_layout)
-        grid.addWidget(manual_limit_group_box, 0, 0)
 
         open_orders_group_box = QGroupBox("미체결 주문 현황")
         open_orders_layout = QVBoxLayout()
@@ -443,13 +685,12 @@ class BinanceCalculatorApp(QWidget):
         self.open_orders_display.setFont(QFont("Consolas", 10))
         self.open_orders_display.setText("미체결 주문 없음")
         open_orders_layout.addWidget(self.open_orders_display)
-        self.cancel_all_orders_button = QPushButton(f"미체결 전체 취소", self)
+        self.cancel_all_orders_button = QPushButton("미체결 전체 취소", self)
         self.cancel_all_orders_button.setFont(button_font)
         self.cancel_all_orders_button.setStyleSheet("background-color: #212529; color: white; padding: 6px; font-weight: bold;")
         self.cancel_all_orders_button.clicked.connect(self.cancel_all_open_orders)
         open_orders_layout.addWidget(self.cancel_all_orders_button)
         open_orders_group_box.setLayout(open_orders_layout)
-        grid.addWidget(open_orders_group_box, 1, 0, 1, 1)
 
         position_group_box = QGroupBox("실시간 포지션 현황")
         position_layout = QVBoxLayout()
@@ -464,8 +705,13 @@ class BinanceCalculatorApp(QWidget):
         self.market_close_button.clicked.connect(self.emergency_market_close)
         position_layout.addWidget(self.market_close_button)
         position_group_box.setLayout(position_layout)
-        grid.addWidget(position_group_box, 2, 0, 3, 1)
 
+        # === Column 1 (중앙) 위젯들 - 독립된 레이아웃 구조 ===
+        center_column_widget = QWidget()
+        center_column_layout = QVBoxLayout(center_column_widget)
+        center_column_layout.setContentsMargins(0, 0, 0, 0)
+
+        # 자산 현황 패널
         self.asset_group_box = QGroupBox("자산 현황 (USDT)")
         asset_main_layout = QVBoxLayout()
         asset_top_layout = QHBoxLayout()
@@ -479,21 +725,38 @@ class BinanceCalculatorApp(QWidget):
         asset_top_layout.addWidget(self.refresh_button)
         asset_main_layout.addLayout(asset_top_layout)
         self.asset_group_box.setLayout(asset_main_layout)
-        grid.addWidget(self.asset_group_box, 0, 1)
 
-        symbol_group_box = QGroupBox("거래 종목 선택")
-        symbol_layout = QVBoxLayout()
+        # 금일 수익률 패널
+        daily_pnl_group_box = QGroupBox("Today")
+        daily_pnl_layout = QVBoxLayout()
+        start_asset_layout = QHBoxLayout()
+        start_asset_layout.addWidget(QLabel("xBase:"))
+        self.start_asset_input = QLineEdit("0", self)
+        self.start_asset_input.setValidator(QDoubleValidator(0.0, 1e9, 2))
+        self.start_asset_input.textChanged.connect(self.update_daily_pnl)
+        start_asset_layout.addWidget(self.start_asset_input)
+        daily_pnl_layout.addLayout(start_asset_layout)
+        self.daily_pnl_label = QLabel("xROE: 0.00%", self)
+        self.daily_pnl_amount_label = QLabel("xPNL: $0.00", self)
+        font = self.daily_pnl_label.font()
+        font.setPointSize(10)
+        self.daily_pnl_label.setFont(font)
+        self.daily_pnl_amount_label.setFont(font)
+        daily_pnl_layout.addWidget(self.daily_pnl_label)
+        daily_pnl_layout.addWidget(self.daily_pnl_amount_label)
+        daily_pnl_layout.addStretch(1)
+        daily_pnl_group_box.setLayout(daily_pnl_layout)
+        
+        # 거래 설정 패널
+        trade_setup_group_box = QGroupBox("Setup")
+        trade_setup_layout = QVBoxLayout()
         self.symbol_combo = QComboBox(self)
         self.symbol_combo.setFont(input_font)
         symbols = self.config.get('TRADING', 'symbols').split(',')
         self.symbol_combo.addItems(symbols)
         self.symbol_combo.setCurrentText(self.current_selected_symbol)
         self.symbol_combo.currentTextChanged.connect(self.on_symbol_changed)
-        symbol_layout.addWidget(self.symbol_combo)
-        symbol_group_box.setLayout(symbol_layout)
-        grid.addWidget(symbol_group_box, 1, 1)
-
-        position_type_group_box = QGroupBox("포지션 선택")
+        trade_setup_layout.addWidget(self.symbol_combo)
         position_type_layout = QHBoxLayout()
         self.long_button = QPushButton("롱 (Long)", self)
         self.long_button.clicked.connect(lambda: self.set_position_type('long'))
@@ -501,12 +764,14 @@ class BinanceCalculatorApp(QWidget):
         self.short_button.clicked.connect(lambda: self.set_position_type('short'))
         position_type_layout.addWidget(self.long_button)
         position_type_layout.addWidget(self.short_button)
-        position_type_group_box.setLayout(position_type_layout)
-        grid.addWidget(position_type_group_box, 2, 1)
-
+        trade_setup_layout.addLayout(position_type_layout)
+        trade_setup_group_box.setLayout(trade_setup_layout)
+        
+        # 거래 정보 입력 패널
         input_group_box = QGroupBox("거래 정보 입력")
         input_form_layout = QVBoxLayout()
         
+        # 기준 가격 (Entry Price)
         entry_price_layout = QHBoxLayout()
         entry_price_label = QLabel("기준 가격:")
         self.entry_price_input = QLineEdit(self)
@@ -517,6 +782,8 @@ class BinanceCalculatorApp(QWidget):
         entry_price_layout.addWidget(entry_price_label)
         entry_price_layout.addWidget(self.entry_price_input)
         input_form_layout.addLayout(entry_price_layout)
+        
+        # 레버리지 (Leverage)
         leverage_layout = QHBoxLayout()
         self.leverage_label = QLabel("레버리지 (x):")
         self.leverage_label.setToolTip("종목 변경 시 최대 레버리지가 자동으로 설정됩니다.")
@@ -527,6 +794,8 @@ class BinanceCalculatorApp(QWidget):
         leverage_layout.addWidget(self.leverage_label)
         leverage_layout.addWidget(self.leverage_input)
         input_form_layout.addLayout(leverage_layout)
+        
+        # 목표 수익률 (ROI)
         roi_layout = QHBoxLayout()
         roi_label = QLabel("목표 수익률 (%):")
         self.roi_input = QLineEdit(self)
@@ -536,19 +805,34 @@ class BinanceCalculatorApp(QWidget):
         roi_layout.addWidget(roi_label)
         roi_layout.addWidget(self.roi_input)
         input_form_layout.addLayout(roi_layout)
-        quantity_layout = QHBoxLayout()
+        
+        # 총 주문 수량
+        quantity_input_layout = QHBoxLayout()
         quantity_label = QLabel("총 주문 수량:")
         self.quantity_input = QLineEdit(self)
         self.quantity_input.setValidator(QDoubleValidator(0.0, 1e6, 8))
         self.quantity_input.setText("0.001")
-        quantity_layout.addWidget(quantity_label)
-        quantity_layout.addWidget(self.quantity_input)
-        self.max_button = QPushButton("Max", self)
+        self.quantity_input.textChanged.connect(self.update_slider_from_quantity)
+        quantity_input_layout.addWidget(quantity_label)
+        quantity_input_layout.addWidget(self.quantity_input)
+        input_form_layout.addLayout(quantity_input_layout)
+
+        # Max / SuperMax 버튼
+        quantity_button_layout = QHBoxLayout()
+        self.max_button = QPushButton("Max (안전)", self)
         self.max_button.setFont(button_font)
-        self.max_button.setFixedWidth(50)
+        self.max_button.setToolTip("주문 실패 없이 안전하게 최대 수량을 계산합니다.")
         self.max_button.clicked.connect(self.set_max_quantity)
-        quantity_layout.addWidget(self.max_button)
-        input_form_layout.addLayout(quantity_layout)
+        quantity_button_layout.addWidget(self.max_button)
+        self.super_max_button = QPushButton("SuperMax (위험)", self)
+        self.super_max_button.setFont(button_font)
+        self.super_max_button.setStyleSheet("background-color: #fd7e14; color: white; font-weight: bold;")
+        self.super_max_button.setToolTip("주문 실패 위험을 감수하고 자투리를 최소화합니다.")
+        self.super_max_button.clicked.connect(self.set_super_max_quantity)
+        quantity_button_layout.addWidget(self.super_max_button)
+        input_form_layout.addLayout(quantity_button_layout)
+        
+        # 수량 슬라이더
         slider_layout = QHBoxLayout()
         self.quantity_slider = QSlider(Qt.Horizontal, self)
         self.quantity_slider.setRange(0, 100)
@@ -558,6 +842,8 @@ class BinanceCalculatorApp(QWidget):
         slider_layout.addWidget(self.quantity_slider)
         slider_layout.addWidget(self.slider_label)
         input_form_layout.addLayout(slider_layout)
+        
+        # 분할 개수/간격
         grid_layout = QHBoxLayout()
         grid_count_label = QLabel("분할 개수:")
         self.grid_count_input = QLineEdit(self)
@@ -573,6 +859,7 @@ class BinanceCalculatorApp(QWidget):
         grid_layout.addWidget(self.grid_interval_input)
         input_form_layout.addLayout(grid_layout)
         
+        # 수수료 종류
         fee_type_layout = QHBoxLayout()
         fee_type_label = QLabel("수수료 종류:")
         self.maker_radio = QRadioButton("Maker", self)
@@ -588,11 +875,19 @@ class BinanceCalculatorApp(QWidget):
         fee_type_layout.addWidget(self.tm_radio)
         input_form_layout.addLayout(fee_type_layout)
         
-        input_form_layout.addStretch(1) 
-        
         input_group_box.setLayout(input_form_layout)
-        grid.addWidget(input_group_box, 3, 1, 2, 1) 
 
+        # 중앙 열 레이아웃에 모든 패널 추가 및 비율 설정
+        center_column_layout.addWidget(self.asset_group_box)
+        center_column_layout.addWidget(daily_pnl_group_box)
+        center_column_layout.addWidget(trade_setup_group_box)
+        center_column_layout.addWidget(input_group_box, 1) # 마지막 위젯이 남는 공간 모두 차지
+        center_column_layout.setStretchFactor(self.asset_group_box, 1)
+        center_column_layout.setStretchFactor(daily_pnl_group_box, 1)
+        center_column_layout.setStretchFactor(trade_setup_group_box, 2)
+        center_column_layout.setStretchFactor(input_group_box, 3)
+
+        # === Column 2 (우측) 위젯들 ===
         result_group_box = QGroupBox("계산 결과")
         result_layout = QVBoxLayout()
         self.target_price_label = QLabel("Target Price: N/A", self)
@@ -604,16 +899,13 @@ class BinanceCalculatorApp(QWidget):
         result_layout.addWidget(self.target_price_label)
         result_layout.addWidget(self.price_change_label)
         result_group_box.setLayout(result_layout)
-        grid.addWidget(result_group_box, 0, 2)
 
         self.order_book_group_box = QGroupBox(f"{self.current_selected_symbol} 실시간 호가")
         order_book_layout = QVBoxLayout()
-        
         self.ask_price_labels = [ClickablePriceLabel(f"Sell {i + 1}: N/A", "#dc3545") for i in range(5)]
         for label in self.ask_price_labels:
             order_book_layout.addWidget(label)
             label.clicked.connect(self.on_order_book_price_clicked)
-            
         order_execution_widget = QWidget()
         order_layout = QHBoxLayout()
         order_layout.setContentsMargins(0, 5, 0, 5)
@@ -627,31 +919,81 @@ class BinanceCalculatorApp(QWidget):
         order_layout.addWidget(self.place_target_order_button)
         order_execution_widget.setLayout(order_layout)
         order_book_layout.addWidget(order_execution_widget)
-        
         self.bid_price_labels = [ClickablePriceLabel(f"Buy {i + 1}: N/A", "#007BFF") for i in range(5)]
         for label in self.bid_price_labels:
             order_book_layout.addWidget(label)
             label.clicked.connect(self.on_order_book_price_clicked)
-            
         order_book_layout.addStretch(1)
 
+        # 로그 보기 버튼을 호가창 아래 오른쪽 구석으로 이동 및 스타일링
+        log_button_layout = QHBoxLayout()
+        self.toggle_log_button = QPushButton("Log", self)
+        self.toggle_log_button.clicked.connect(self.toggle_log_view)
+        self.toggle_log_button.setFixedSize(40, 22)
+        self.toggle_log_button.setStyleSheet("""QPushButton {background-color: #212529; color: white; border: none; border-radius: 4px; font-size: 9pt; font-weight: bold;} QPushButton:hover {background-color: #343a40;}""")
+        log_button_layout.addStretch(1)
+        log_button_layout.addWidget(self.toggle_log_button)
+        order_book_layout.addLayout(log_button_layout)
+        
         self.order_book_group_box.setLayout(order_book_layout)
-        grid.addWidget(self.order_book_group_box, 1, 2, 4, 1)
+        
+        # --- 3. 메인 그리드에 각 열과 위젯 배치 ---
+        main_grid.addWidget(manual_limit_group_box, 0, 0)
+        main_grid.addWidget(open_orders_group_box, 1, 0)
+        main_grid.addWidget(position_group_box, 2, 0, 3, 1)
+        main_grid.addWidget(center_column_widget, 0, 1, 5, 1)
+        main_grid.addWidget(result_group_box, 0, 2)
+        main_grid.addWidget(self.order_book_group_box, 1, 2, 4, 1)
+        self.log_display_group = QGroupBox("실시간 로그")
+        log_layout = QVBoxLayout()
+        self.log_display = QTextEdit(self)
+        self.log_display.setReadOnly(True)
+        self.log_display.setFont(QFont("Consolas", 9))
+        log_layout.addWidget(self.log_display)
+        self.log_display_group.setLayout(log_layout)
+        self.log_display_group.hide()
+        main_grid.addWidget(self.log_display_group, 5, 0, 1, 3)
 
-        grid.setColumnStretch(0, 2)
-        grid.setColumnStretch(1, 2)
-        grid.setColumnStretch(2, 3)
-        
-        grid.setRowStretch(0, 0)
-        grid.setRowStretch(1, 1)
-        grid.setRowStretch(2, 2)
-        grid.setRowStretch(3, 1) 
-        grid.setRowStretch(4, 1) 
-        
+        # --- 4. 최종 스트레치 및 UI 초기화 ---
+        main_grid.setColumnStretch(0, 2)
+        main_grid.setColumnStretch(1, 2)
+        main_grid.setColumnStretch(2, 3)
+        main_grid.setRowStretch(0, 0)
+        main_grid.setRowStretch(1, 1) # 미체결 주문 패널: 비율 1
+        main_grid.setRowStretch(2, 2) # 실시간 포지션 패널: 비율 2
+        main_grid.setRowStretch(3, 0)
+        main_grid.setRowStretch(4, 0)
+        main_grid.setRowStretch(5, 0)
+
         self.update_button_style()
         self.calculate_and_display_target()
-        
         self.setup_shortcuts()
+
+    # 'toggle_log_view' 함수
+    def toggle_log_view(self):
+        grid = self.layout()
+        if self.log_display_group.isVisible():
+            self.log_display_group.hide()
+            self.toggle_log_button.setText("Log")
+            grid.setRowStretch(5, 0)
+            
+            # --- ▼▼▼ 창 크기 복원 로직 강화 (MinimumSize 추가) ▼▼▼ ---
+            self.setMinimumSize(820, 640)  # 최소 크기를 원래 크기로 강제 지정
+            self.setMaximumSize(820, 640) # 최대 크기를 원래 크기로 강제 지정
+            self.resize(820, 640)         # 크기를 820x640으로 복원
+            # --- ▲▲▲ 수정 끝 ▲▲▲ ---
+            
+        else:
+            self.load_log_content()
+            self.log_display_group.show()
+            self.toggle_log_button.setText("Hide")
+            grid.setRowStretch(5, 1)
+            
+            # --- ▼▼▼ Max/Min 크기 제약 해제 ▼▼▼ ---
+            # 로그 창이 보일 때 창이 확장될 수 있도록 최대/최소 크기 제약을 해제합니다.
+            self.setMaximumSize(QSize(16777215, 16777215))
+            self.setMinimumSize(0, 0) # QSize(0, 0) 대신 0, 0을 사용합니다.
+            # --- ▲▲▲ 수정 끝 ▲▲▲ ---
 
     def setup_shortcuts(self):
         shortcut_map = {
@@ -716,7 +1058,6 @@ class BinanceCalculatorApp(QWidget):
                 label.setText("N/A")
 
     def start_worker(self):
-        # 이 함수를 호출한 신호 소스(sender)가 QThread일 경우에만 연결을 해제합니다.
         sender = self.sender()
         if sender and isinstance(sender, QThread):
             sender.finished.disconnect(self.start_worker)
@@ -924,8 +1265,9 @@ class BinanceCalculatorApp(QWidget):
             for asset in account_info['assets']:
                 if asset['asset'] == 'USDT':
                     self.available_balance = Decimal(asset['availableBalance'])
-                    self.balance_label.setText(f"사용 가능: ${self.available_balance:,.2f}")
+                    self.balance_label.setText(f"사용 가능(테스트): ${self.available_balance:,.2f}")
                     return
+            self.update_daily_pnl()
         except Exception as e:
             logging.error(f"자산 정보 로드 실패: {e}", exc_info=True)
             self.balance_label.setText("자산 로드 실패")
@@ -1069,8 +1411,48 @@ class BinanceCalculatorApp(QWidget):
         self.place_order_logic('target')
 
     def set_max_quantity(self):
-        self.quantity_slider.setValue(100)
-        self.update_quantity_from_slider()
+        """Max 버튼 클릭 시 실행될 함수. '반내림(ROUND_DOWN)'을 사용하여 안전한 최대 수량을 계산합니다."""
+        
+        try:
+            percentage = 100  # Max는 무조건 100%
+            self.slider_label.setText(f"{percentage}%")
+            self.quantity_slider.setValue(percentage) # 슬라이더 UI는 100으로 동기화 (시그널 발생 여부 무시)
+
+            if not self.leverage_input.text() or self.available_balance <= 0: return
+
+            leverage = Decimal(self.leverage_input.text())
+            # '기준 가격' 필드가 비어있으면 호가창 가격을 사용, 둘 다 없으면 리턴
+            entry_price = self.best_ask_price if self.position_type != 'short' else self.best_bid_price
+            if entry_price <= Decimal('0'):
+                if self.entry_price_input.text() and Decimal(self.entry_price_input.text()) > 0:
+                    entry_price = Decimal(self.entry_price_input.text())
+                else:
+                    return
+
+            max_usdt_value = self.available_balance * leverage
+            adjusted_max_usdt_value, effective_leverage = self.get_adjusted_max_notional(max_usdt_value, leverage)
+
+            if int(leverage) != int(effective_leverage):
+                self.leverage_input.setText(str(int(effective_leverage)))
+
+            if entry_price > Decimal('0'):
+                max_quantity = adjusted_max_usdt_value / entry_price
+                target_quantity = max_quantity * (Decimal(percentage) / Decimal('100'))
+                
+                # Max(안전)의 핵심: ROUND_DOWN (반내림)을 사용하여 안전한 최대 수량을 계산합니다.
+                if self.step_size > Decimal('0'):
+                    safe_max_quantity = target_quantity.quantize(self.step_size, rounding=ROUND_DOWN)
+                else:
+                    safe_max_quantity = target_quantity
+
+                # quantity_input에 직접 텍스트를 설정하여 강제 갱신합니다.
+                self.quantity_input.setText(str(safe_max_quantity.normalize()) if safe_max_quantity > 0 else "0")
+            else:
+                self.quantity_input.setText("0")
+
+        except Exception as e:
+            logging.error(f"Max 수량 계산 오류: {e}", exc_info=True)
+            QMessageBox.warning(self, "계산 오류", f"Max 수량 계산 중 오류가 발생했습니다:\n{e}")
 
     def update_quantity_from_slider(self):
         try:
@@ -1142,6 +1524,41 @@ class BinanceCalculatorApp(QWidget):
         else:
             self.long_button.setStyleSheet(default_style)
             self.short_button.setStyleSheet(default_style)
+    
+    # 'toggle_log_view' 함수
+    def toggle_log_view(self):
+        grid = self.layout()
+        if self.log_display_group.isVisible():
+            self.log_display_group.hide()
+            self.toggle_log_button.setText("Log")
+            grid.setRowStretch(5, 0)
+            
+            # --- ▼▼▼ 창 크기 복원 로직 강화 (MinimumSize 추가) ▼▼▼ ---
+            self.setMinimumSize(820, 640)  # 최소 크기를 원래 크기로 강제 지정
+            self.setMaximumSize(820, 640) # 최대 크기를 원래 크기로 강제 지정
+            self.resize(820, 640)         # 크기를 820x640으로 복원
+            # --- ▲▲▲ 수정 끝 ▲▲▲ ---
+            
+        else:
+            self.load_log_content()
+            self.log_display_group.show()
+            self.toggle_log_button.setText("Hide")
+            grid.setRowStretch(5, 1)
+            
+            # --- ▼▼▼ Max/Min 크기 제약 해제 ▼▼▼ ---
+            # 로그 창이 보일 때 창이 확장될 수 있도록 최대/최소 크기 제약을 해제합니다.
+            self.setMaximumSize(QSize(16777215, 16777215))
+            self.setMinimumSize(0, 0) # QSize(0, 0) 대신 0, 0을 사용합니다.
+            # --- ▲▲▲ 수정 끝 ▲▲▲ ---
+
+    def load_log_content(self):
+        log_path = os.path.join(BASE_DIR, 'trading_app.log')
+        try:
+            with open(log_path, 'r', encoding='utf-8') as f: # <--- log_path 사용으로 변경
+                self.log_display.setText(f.read())
+            self.log_display.verticalScrollBar().setValue(self.log_display.verticalScrollBar().maximum())
+        except Exception as e:
+            self.log_display.setText(f"로그 파일을 읽는 데 실패했습니다: {e}")
 
     def calculate_and_display_target(self):
         try:
@@ -1194,17 +1611,22 @@ class BinanceCalculatorApp(QWidget):
             self.target_price_label.setText("Target Price: N/A")
             self.price_change_label.setText("NLV: N/A")
 
-def _start_main_app(app, splash_manager):
+# blc17.py 하단
+def _start_main_app(app, splash_manager, player, client): # client 인자 추가
     try:
-        ex = BinanceCalculatorApp()
-        splash_manager.hide_splash(main_window=ex, duration_ms=500) 
-        QTimer.singleShot(500, lambda: _show_main_window(ex))
+        ex = BinanceCalculatorApp(client) # 생성자에 client 전달
+        splash_manager.hide_splash(main_window=ex, duration_ms=1000) 
+        QTimer.singleShot(1000, lambda: _show_main_window(ex, player))
     except Exception as e:
         logging.critical("메인 앱 초기화 중 치명적인 오류 발생.", exc_info=True)
+        player.stop()
         QCoreApplication.quit()
 
-def _show_main_window(main_window):
+
+def _show_main_window(main_window, player): # player 인자 추가
+    """스플래시가 완전히 닫힌 후 메인 창을 띄우고 음악을 멈춥니다."""
     main_window.show()
+    player.stop() # 메인 창이 뜨면 음악 정지
     logging.info("애플리케이션 시작.")
 
 if __name__ == "__main__":
@@ -1215,12 +1637,35 @@ if __name__ == "__main__":
     if not os.path.exists('shortcuts.json'):
         create_default_shortcuts()
     
-    try:
-        app = QApplication(sys.argv)
+    app = QApplication(sys.argv)
+    app.setWindowIcon(QIcon(os.path.join(BASE_DIR, 'favicon.ico')))
+    
+    login = LoginDialog()
+    
+    if login.exec_() == QDialog.Accepted:
+        client = login.client # 로그인 성공 후 생성된 client 객체를 가져옴
+
+        player = QMediaPlayer()
+        
+        # 2. 음악 파일 경로 설정 (BASE_DIR 사용)
+        file_path = os.path.join(BASE_DIR, 'login_sound.mp3')
+        url = QUrl.fromLocalFile(file_path)
+        content = QMediaContent(url)
+        
+        # 3. 플레이어에 음악 로드 및 볼륨 설정
+        player.setMedia(content)
+        player.setVolume(50) # 0~100 사이 값으로 볼륨 조절
+
+        # 4. 스플래시 화면 띄우기
         splash_manager = SplashManager(image_path="splash_boot.png") 
         splash_manager.show_splash()
-        QTimer.singleShot(500, lambda: _start_main_app(app, splash_manager)) 
-        sys.exit(app.exec_()) 
-    except Exception as e:
-        logging.critical("애플리케이션 실행 중 치명적인 오류 발생.", exc_info=True)
-        sys.exit(1)
+
+        # 5. 음악 재생
+        player.play()
+        
+        # _start_main_app 함수에 client 객체 전달
+        QTimer.singleShot(8200, lambda: _start_main_app(app, splash_manager, player, client)) 
+        
+        sys.exit(app.exec_())
+    else:
+        sys.exit(0)

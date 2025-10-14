@@ -6,16 +6,24 @@ import math
 import os
 import configparser
 import logging
+import pyotp
 from logging.handlers import RotatingFileHandler
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, ROUND_CEILING, ROUND_FLOOR
+
+# blc17.py 상단
+from PyQt5.QtCore import (
+    Qt, QObject, pyqtSignal, QThread, QTimer, QCoreApplication,
+    QPropertyAnimation, QEasingCurve, QUrl 
+)
+from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
 
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QComboBox, QMessageBox, QGroupBox, QTextEdit,
     QRadioButton, QSlider, QGridLayout, QSplashScreen, 
-    QDesktopWidget, QShortcut 
+    QDesktopWidget, QShortcut, QDialog
 )
-from PyQt5.QtGui import QFont, QDoubleValidator, QCursor, QPixmap, QKeySequence 
+from PyQt5.QtGui import QFont, QDoubleValidator, QCursor, QPixmap, QKeySequence, QIcon
 from PyQt5.QtCore import (
     Qt, QObject, pyqtSignal, QThread, QTimer, QCoreApplication,
     QPropertyAnimation, QEasingCurve 
@@ -23,17 +31,27 @@ from PyQt5.QtCore import (
 
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
+# 'password_util.py' 파일이 있어야 비밀번호 검증 함수를 가져올 수 있습니다.
+try:
+    from password_util import verify_password
+except ImportError:
+    print("경고: 'password_util.py' 파일을 찾을 수 없습니다. 로그인 기능이 동작하지 않습니다.")
+    # 임시 검증 함수 (실제 사용에는 부적합)
+    def verify_password(stored, provided):
+        return stored == provided
+
 # 'config' 모듈이 있어야 API KEY와 SECRET KEY를 가져올 수 있습니다.
-# 이 파일을 실행하는 디렉토리에 config.py 파일이 필요합니다.
 try:
     import config 
 except ImportError:
-    # config.py가 없는 경우 로깅을 통해 사용자에게 알림
     print("경고: 'config.py' 파일을 찾을 수 없습니다. API 연동 기능이 동작하지 않을 수 있습니다.")
     class DummyConfig:
         API_KEY = "YOUR_API_KEY"
         SECRET_KEY = "YOUR_SECRET_KEY"
     config = DummyConfig()
+
+# 실행 파일의 위치를 기준으로 절대 경로를 생성하기 위한 기준점
+BASE_DIR = os.path.dirname(os.path.abspath(sys.argv[0]))
 
 
 # --- 로깅 시스템 설정 ---
@@ -75,7 +93,8 @@ def create_default_config():
 
 
 # --- 단축키 설정 파일 관리 ---
-def load_shortcuts(filename='shortcuts.json'):
+
+def load_shortcuts(filename=os.path.join(BASE_DIR, 'shortcuts.json')):
     if os.path.exists(filename):
         try:
             with open(filename, 'r', encoding='utf-8') as f:
@@ -173,6 +192,98 @@ class SplashManager(QObject):
                 self.splash.deleteLater()
 
 
+# --- 로그인 다이얼로그 클래스 ---
+class LoginDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Binance Station Alpha v1.0")
+        self.setFixedSize(300, 120)
+
+        self.is_otp_stage = False
+        
+        layout = QGridLayout()
+        self.setLayout(layout)
+
+        # 위젯 생성
+        self.id_label = QLabel("아이디:")
+        self.id_input = QLineEdit(self)
+        self.pw_label = QLabel("비밀번호:")
+        self.password_input = QLineEdit(self)
+        self.password_input.setEchoMode(QLineEdit.Password)
+
+        self.login_button = QPushButton("로그인", self)
+        self.message_label = QLabel("", self)
+        self.message_label.setStyleSheet("color: red;")
+
+        # 레이아웃에 위젯 추가
+        layout.addWidget(self.id_label, 0, 0)
+        layout.addWidget(self.id_input, 0, 1)
+        layout.addWidget(self.pw_label, 1, 0)
+        layout.addWidget(self.password_input, 1, 1)
+        layout.addWidget(self.login_button, 2, 0, 1, 2)
+        layout.addWidget(self.message_label, 3, 0, 1, 2)
+        
+        # 시그널 연결
+        self.login_button.clicked.connect(self._handle_login)
+        self.password_input.returnPressed.connect(self._handle_login)
+
+    def _handle_login(self):
+        # OTP 입력 단계일 경우
+        if self.is_otp_stage:
+            self._verify_otp()
+            return
+        
+        # --- 여기에 마스터의 아이디와 암호화된 비밀번호를 설정합니다 ---
+        correct_id = "goldenfugu21"
+        # `password_util.py`로 생성한 해시 값을 여기에 붙여넣으세요.
+        correct_password_hash = b'\xfe\xa4\x1d\xd1\xfd\xb4^l\xadC\xf8A\xc6\xaa\xa7x`|\x8f\x1akd\x855E\x92\xb1|JO*\x80\r_Yz\xdbt\x9cF\x89N\x08A\xc2\x13\x0f\xbd[f\x1b|\x06\rm\xe8\x11\xc3\xf2]H\r\x0b\x1d'
+
+        entered_id = self.id_input.text()
+        entered_pw = self.password_input.text()
+
+        try:
+            if entered_id == correct_id and verify_password(correct_password_hash, entered_pw):
+                # 아이디/비번 성공 시, OTP 입력 단계로 전환
+                self._switch_to_otp_stage()
+            else:
+                self.message_label.setText("아이디 또는 비밀번호가 틀렸습니다.")
+        except Exception:
+            self.message_label.setText("비밀번호 검증 오류.")
+
+    def _switch_to_otp_stage(self):
+        self.is_otp_stage = True
+        self.setWindowTitle("OTP 인증")
+        
+        self.id_label.setText("OTP 코드:")
+        self.id_input.clear()
+        self.id_input.setPlaceholderText("6자리 코드를 입력하세요")
+        
+        self.pw_label.hide()
+        self.password_input.hide()
+        
+        self.login_button.setText("로그인")
+        self.message_label.setText("")
+        
+        # OTP 입력 필드에 포커스
+        self.id_input.setFocus()
+        
+        # 엔터 키 연결을 OTP 입력 필드로 변경
+        self.password_input.returnPressed.disconnect()
+        self.id_input.returnPressed.connect(self._handle_login)
+
+    def _verify_otp(self):
+        # 2단계에서 생성된 '비밀 키'를 여기에 붙여넣으세요.
+        secret_key = "GOZTUG45MBOGODWSBTEC55O7WV7S2DYW"
+        
+        totp = pyotp.TOTP(secret_key)
+        entered_otp = self.id_input.text()
+
+        if totp.verify(entered_otp):
+            self.accept() # OTP 성공 시 최종 로그인
+        else:
+            self.message_label.setText("OTP 코드가 올바르지 않습니다.")
+
+
 # --- 커스텀 라벨 클래스 ---
 class ClickablePriceLabel(QLabel):
     clicked = pyqtSignal(str)
@@ -252,7 +363,7 @@ class BinanceCalculatorApp(QWidget):
         if not self.config.read('config.ini', encoding='utf-8'):
             logging.error("config.ini 파일을 읽을 수 없습니다. 기본 설정이 필요합니다.")
 
-        self.setWindowTitle("Binance Station Alpha V1.0 (Live landscape Mode)")
+        self.setWindowTitle("Binance Station Alpha v1.0")
         
         self.resize(820, 640) 
         self.center()
@@ -284,7 +395,7 @@ class BinanceCalculatorApp(QWidget):
         self.calculated_ntp_decimal = None
         
         try:
-             self.shortcuts = load_shortcuts()
+             self.shortcuts = load_shortcuts(filename=os.path.join(BASE_DIR, 'shortcuts.json'))
         except Exception as e:
              logging.error(f"shortcuts.json 파일 로드 실패: {e}")
              self.shortcuts = {} 
@@ -443,7 +554,7 @@ class BinanceCalculatorApp(QWidget):
         self.open_orders_display.setFont(QFont("Consolas", 10))
         self.open_orders_display.setText("미체결 주문 없음")
         open_orders_layout.addWidget(self.open_orders_display)
-        self.cancel_all_orders_button = QPushButton(f"미체결 전체 취소", self)
+        self.cancel_all_orders_button = QPushButton(f"{self.current_selected_symbol} 미체결 전체 취소", self)
         self.cancel_all_orders_button.setFont(button_font)
         self.cancel_all_orders_button.setStyleSheet("background-color: #212529; color: white; padding: 6px; font-weight: bold;")
         self.cancel_all_orders_button.clicked.connect(self.cancel_all_open_orders)
@@ -646,7 +757,22 @@ class BinanceCalculatorApp(QWidget):
         grid.setRowStretch(1, 1)
         grid.setRowStretch(2, 2)
         grid.setRowStretch(3, 1) 
-        grid.setRowStretch(4, 1) 
+        grid.setRowStretch(4, 1)
+        
+        self.log_display_group = QGroupBox("실시간 로그")
+        log_layout = QVBoxLayout()
+        self.log_display = QTextEdit(self)
+        self.log_display.setReadOnly(True)
+        self.log_display.setFont(QFont("Consolas", 9))
+        log_layout.addWidget(self.log_display)
+        self.log_display_group.setLayout(log_layout)
+        self.log_display_group.hide()
+        grid.addWidget(self.log_display_group, 5, 0, 1, 3)
+        grid.setRowStretch(5, 0)
+
+        self.toggle_log_button = QPushButton("로그 보기", self)
+        self.toggle_log_button.clicked.connect(self.toggle_log_view)
+        asset_main_layout.addWidget(self.toggle_log_button)
         
         self.update_button_style()
         self.calculate_and_display_target()
@@ -716,7 +842,6 @@ class BinanceCalculatorApp(QWidget):
                 label.setText("N/A")
 
     def start_worker(self):
-        # 이 함수를 호출한 신호 소스(sender)가 QThread일 경우에만 연결을 해제합니다.
         sender = self.sender()
         if sender and isinstance(sender, QThread):
             sender.finished.disconnect(self.start_worker)
@@ -1142,6 +1267,25 @@ class BinanceCalculatorApp(QWidget):
         else:
             self.long_button.setStyleSheet(default_style)
             self.short_button.setStyleSheet(default_style)
+    
+    def toggle_log_view(self):
+        if self.log_display_group.isVisible():
+            self.log_display_group.hide()
+            self.toggle_log_button.setText("로그 보기")
+            self.layout().setRowStretch(5, 0)
+        else:
+            self.load_log_content()
+            self.log_display_group.show()
+            self.toggle_log_button.setText("로그 숨기기")
+            self.layout().setRowStretch(5, 1)
+
+    def load_log_content(self):
+        try:
+            with open('trading_app.log', 'r', encoding='utf-8') as f:
+                self.log_display.setText(f.read())
+            self.log_display.verticalScrollBar().setValue(self.log_display.verticalScrollBar().maximum())
+        except Exception as e:
+            self.log_display.setText(f"로그 파일을 읽는 데 실패했습니다: {e}")
 
     def calculate_and_display_target(self):
         try:
@@ -1194,17 +1338,26 @@ class BinanceCalculatorApp(QWidget):
             self.target_price_label.setText("Target Price: N/A")
             self.price_change_label.setText("NLV: N/A")
 
-def _start_main_app(app, splash_manager):
+# blc17.py 하단
+def _start_main_app(app, splash_manager, player): # player 인자 추가
+    """타이머에 의해 호출되어 메인 앱을 초기화하고 스플래시를 닫습니다."""
     try:
         ex = BinanceCalculatorApp()
-        splash_manager.hide_splash(main_window=ex, duration_ms=500) 
-        QTimer.singleShot(500, lambda: _show_main_window(ex))
+        splash_manager.hide_splash(main_window=ex, duration_ms=1000) 
+        
+        # 메인 창을 띄우는 함수에 player 객체 전달
+        QTimer.singleShot(1000, lambda: _show_main_window(ex, player))
+        
     except Exception as e:
         logging.critical("메인 앱 초기화 중 치명적인 오류 발생.", exc_info=True)
+        player.stop() # 오류 발생 시에도 음악 정지
         QCoreApplication.quit()
 
-def _show_main_window(main_window):
+
+def _show_main_window(main_window, player): # player 인자 추가
+    """스플래시가 완전히 닫힌 후 메인 창을 띄우고 음악을 멈춥니다."""
     main_window.show()
+    player.stop() # 메인 창이 뜨면 음악 정지
     logging.info("애플리케이션 시작.")
 
 if __name__ == "__main__":
@@ -1215,12 +1368,35 @@ if __name__ == "__main__":
     if not os.path.exists('shortcuts.json'):
         create_default_shortcuts()
     
-    try:
-        app = QApplication(sys.argv)
+    app = QApplication(sys.argv)
+    app.setWindowIcon(QIcon('favicon.ico')) # <<< 파비콘 적용 줄을 추가합니다.
+    
+    login = LoginDialog()
+    
+    
+    if login.exec_() == QDialog.Accepted:
+        # 1. 미디어 플레이어 객체 생성
+        player = QMediaPlayer()
+        
+        # 2. 음악 파일 경로 설정 (BASE_DIR 사용)
+        file_path = os.path.join(BASE_DIR, 'login_sound.mp3')
+        url = QUrl.fromLocalFile(file_path)
+        content = QMediaContent(url)
+        
+        # 3. 플레이어에 음악 로드 및 볼륨 설정
+        player.setMedia(content)
+        player.setVolume(50) # 0~100 사이 값으로 볼륨 조절
+
+        # 4. 스플래시 화면 띄우기
         splash_manager = SplashManager(image_path="splash_boot.png") 
         splash_manager.show_splash()
-        QTimer.singleShot(500, lambda: _start_main_app(app, splash_manager)) 
-        sys.exit(app.exec_()) 
-    except Exception as e:
-        logging.critical("애플리케이션 실행 중 치명적인 오류 발생.", exc_info=True)
-        sys.exit(1)
+
+        # 5. 음악 재생!
+        player.play()
+        
+        # 6. 메인 앱 시작 함수에 player 객체 전달
+        QTimer.singleShot(8200, lambda: _start_main_app(app, splash_manager, player)) 
+        
+        sys.exit(app.exec_())
+    else:
+        sys.exit(0)

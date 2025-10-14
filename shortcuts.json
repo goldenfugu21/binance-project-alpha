@@ -1,0 +1,8 @@
+{
+    "Market_Close": "Ctrl+Shift+E",
+    "Cancel_All_Orders": "Ctrl+Shift+Z",
+    "Limit_Exit": "Ctrl+Shift+X",
+    "Place_Entry_Order": "Ctrl+Alt+Q",
+    "Place_Target_Order": "Ctrl+Alt+W",
+    "Refresh_Data": "F5"
+}

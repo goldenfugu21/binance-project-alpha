@@ -6,6 +6,10 @@ import math
 import os
 import configparser
 import logging
+import pyotp
+import smtplib
+import random
+from email.message import EmailMessage
 from logging.handlers import RotatingFileHandler
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, ROUND_CEILING, ROUND_FLOOR
 
@@ -13,39 +17,33 @@ from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QComboBox, QMessageBox, QGroupBox, QTextEdit,
     QRadioButton, QSlider, QGridLayout, QSplashScreen, 
-    QDesktopWidget, QShortcut 
+    QDesktopWidget, QShortcut, QDialog
 )
-from PyQt5.QtGui import QFont, QDoubleValidator, QCursor, QPixmap, QKeySequence 
+from PyQt5.QtGui import QFont, QDoubleValidator, QCursor, QPixmap, QKeySequence, QIcon
 from PyQt5.QtCore import (
     Qt, QObject, pyqtSignal, QThread, QTimer, QCoreApplication,
-    QPropertyAnimation, QEasingCurve 
+    QPropertyAnimation, QEasingCurve, QUrl
 )
+from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
 
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
-# 'config' 모듈이 있어야 API KEY와 SECRET KEY를 가져올 수 있습니다.
-# 이 파일을 실행하는 디렉토리에 config.py 파일이 필요합니다.
-try:
-    import config 
-except ImportError:
-    # config.py가 없는 경우 로깅을 통해 사용자에게 알림
-    print("경고: 'config.py' 파일을 찾을 수 없습니다. API 연동 기능이 동작하지 않을 수 있습니다.")
-    class DummyConfig:
-        API_KEY = "YOUR_API_KEY"
-        SECRET_KEY = "YOUR_SECRET_KEY"
-    config = DummyConfig()
+
+# --- 유틸리티 파일 임포트 ---
+# 이 파일들이 없으면 프로그램이 시작되지 않는 것이 정상입니다.
+from password_util import verify_password
+from crypto_util import decrypt_data
+
+BASE_DIR = os.path.dirname(os.path.abspath(sys.argv[0]))
 
 
 # --- 로깅 시스템 설정 ---
 def setup_logging():
     log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-
-    log_handler = RotatingFileHandler('trading_app.log', maxBytes=5 * 1024 * 1024, backupCount=3, encoding='utf-8')
+    log_handler = RotatingFileHandler(os.path.join(BASE_DIR, 'trading_app.log'), maxBytes=5 * 1024 * 1024, backupCount=3, encoding='utf-8')
     log_handler.setFormatter(log_formatter)
-
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(log_formatter)
-
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.INFO)
     root_logger.addHandler(log_handler)
@@ -55,27 +53,16 @@ def setup_logging():
 # --- 설정 파일 관리 ---
 def create_default_config():
     config_obj = configparser.ConfigParser()
-    config_obj['API'] = {
-        'api_url': 'https://fapi.binance.com/fapi',
-        'websocket_base_uri': 'wss://fstream.binance.com/ws'
-    }
-    config_obj['TRADING'] = {
-        'default_symbol': 'BTCUSDT',
-        'symbols': 'BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT',
-        'maker_fee_rate': '0.0002',
-        'taker_fee_rate': '0.0004'
-    }
-    config_obj['APP_SETTINGS'] = {
-        'position_update_interval_ms': '2000',
-        'ui_update_interval_ms': '100'
-    }
-    with open('config.ini', 'w', encoding='utf-8') as configfile:
+    config_obj['API'] = {'api_url': 'https://fapi.binance.com/fapi', 'websocket_base_uri': 'wss://fstream.binance.com/ws'}
+    config_obj['TRADING'] = {'default_symbol': 'BTCUSDT', 'symbols': 'BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT', 'maker_fee_rate': '0.0002', 'taker_fee_rate': '0.0004'}
+    config_obj['APP_SETTINGS'] = {'position_update_interval_ms': '2000', 'ui_update_interval_ms': '100'}
+    with open(os.path.join(BASE_DIR, 'config.ini'), 'w', encoding='utf-8') as configfile:
         config_obj.write(configfile)
     logging.info("기본 'config.ini' 파일이 생성되었습니다.")
 
 
 # --- 단축키 설정 파일 관리 ---
-def load_shortcuts(filename='shortcuts.json'):
+def load_shortcuts(filename=os.path.join(BASE_DIR, 'shortcuts.json')):
     if os.path.exists(filename):
         try:
             with open(filename, 'r', encoding='utf-8') as f:
@@ -89,42 +76,52 @@ def load_shortcuts(filename='shortcuts.json'):
         return create_default_shortcuts(write_file=True)
 
 def create_default_shortcuts(write_file=True):
-    default_shortcuts = {
-        "Market_Close": "Ctrl+Shift+E",
-        "Cancel_All_Orders": "Ctrl+Shift+Z",
-        "Limit_Exit": "Ctrl+Shift+X",
-        "Place_Entry_Order": "Ctrl+Alt+Q",
-        "Place_Target_Order": "Ctrl+Alt+W",
-        "Refresh_Data": "F5"
-    }
-    
+    default_shortcuts = {"Market_Close": "Ctrl+Shift+E", "Cancel_All_Orders": "Ctrl+Shift+Z", "Limit_Exit": "Ctrl+Shift+X", "Place_Entry_Order": "Ctrl+Alt+Q", "Place_Target_Order": "Ctrl+Alt+W", "Refresh_Data": "F5"}
     if write_file:
         try:
-            with open('shortcuts.json', 'w', encoding='utf-8') as f:
+            with open(os.path.join(BASE_DIR, 'shortcuts.json'), 'w', encoding='utf-8') as f:
                 json.dump(default_shortcuts, f, ensure_ascii=False, indent=4)
             logging.info("기본 'shortcuts.json' 파일이 생성되었습니다.")
         except Exception as e:
             logging.error(f"기본 'shortcuts.json' 파일 생성 실패: {e}")
-            
     return default_shortcuts
+
+
+# --- Gmail 이메일 발송 함수 ---
+def send_verification_email(receiver_email):
+    verification_code = str(random.randint(100000, 999999))
+    SMTP_SERVER = "smtp.gmail.com"
+    SMTP_PORT = 587
+    SENDER_EMAIL = "0tlswogur@gmail.com"
+    SENDER_PASSWORD = "szqjugnhieaoitir"
+    msg = EmailMessage()
+    msg["Subject"] = "Binance Station Alpha 인증번호"
+    msg["From"] = SENDER_EMAIL
+    msg["To"] = receiver_email
+    msg.set_content(f"인증번호: {verification_code}")
+    try:
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as smtp:
+            smtp.starttls()
+            smtp.login(SENDER_EMAIL, SENDER_PASSWORD)
+            smtp.send_message(msg)
+        logging.info(f"인증번호 {verification_code}를 {receiver_email}로 발송했습니다.")
+        return verification_code
+    except Exception as e:
+        logging.error(f"이메일 발송 실패: {e}")
+        return None
 
 
 # --- 스플래시 스크린 관리 클래스 ---
 class SplashManager(QObject):
     def __init__(self, parent=None, image_path="splash_boot.png"):
         super().__init__(parent)
-        
-        base_dir = os.path.dirname(sys.argv[0]) 
-        self.full_image_path = os.path.join(base_dir, image_path)
-        
+        self.full_image_path = os.path.join(BASE_DIR, image_path)
         self.splash = None
         self.is_ready = False
         self.pixmap = None
         self.animation = None
-        
         try:
             self.pixmap = QPixmap(self.full_image_path)
-            
             if self.pixmap.isNull():
                 logging.error(f"스플래시 이미지 로드 실패: 절대 경로({self.full_image_path})를 확인하세요.")
             else:
@@ -133,32 +130,24 @@ class SplashManager(QObject):
             logging.error(f"스플래시 초기화 중 오류: {e}")
 
     def show_splash(self):
-        if not self.is_ready:
-            return
-        
+        if not self.is_ready: return
         self.splash = QSplashScreen(self.pixmap)
         screen_geometry = QApplication.desktop().screenGeometry()
         x = (screen_geometry.width() - self.pixmap.width()) // 2
         y = (screen_geometry.height() - self.pixmap.height()) // 2
         self.splash.move(x, y)
-        
         self.animation = QPropertyAnimation(self.splash, b"windowOpacity")
-        self.animation.setDuration(400) 
+        self.animation.setDuration(400)
         self.animation.setStartValue(0.0)
         self.animation.setEndValue(1.0)
         self.animation.setEasingCurve(QEasingCurve.InQuad)
-        
         self.splash.setWindowOpacity(0.0)
         self.splash.show()
-        self.animation.start() 
+        self.animation.start()
         
     def hide_splash(self, main_window=None, duration_ms=0):
-        if not self.is_ready or not self.splash:
-            return
-            
-        if self.animation and self.animation.state() == QPropertyAnimation.Running:
-            self.animation.stop() 
-        
+        if not self.is_ready or not self.splash: return
+        if self.animation and self.animation.state() == QPropertyAnimation.Running: self.animation.stop()
         if duration_ms > 0:
             QTimer.singleShot(duration_ms, lambda: self._finalize_hide(main_window))
         else:
@@ -166,17 +155,141 @@ class SplashManager(QObject):
             
     def _finalize_hide(self, main_window):
         if self.splash:
-            if main_window:
-                self.splash.finish(main_window)
+            if main_window: self.splash.finish(main_window)
             else:
                 self.splash.close()
                 self.splash.deleteLater()
 
 
+# --- 로그인 다이얼로그 클래스 ---
+class LoginDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Binance Station Alpha v1.0")
+        self.setFixedSize(300, 120)
+        
+        self.auth_stage = 0  # 0: 비밀번호, 1: OTP, 2: 이메일
+        self.sent_email_code = None
+        self.user_email = ""
+        self.client = None
+
+        layout = QGridLayout()
+        self.setLayout(layout)
+
+        # 위젯 생성
+        self.id_label = QLabel("아이디:")
+        self.id_input = QLineEdit(self)
+        self.pw_label = QLabel("비밀번호:")
+        self.password_input = QLineEdit(self)
+        self.password_input.setEchoMode(QLineEdit.Password)
+
+        self.login_button = QPushButton("다음", self)
+        self.message_label = QLabel("", self)
+
+        # 레이아웃에 위젯 추가
+        layout.addWidget(self.id_label, 0, 0)
+        layout.addWidget(self.id_input, 0, 1)
+        layout.addWidget(self.pw_label, 1, 0)
+        layout.addWidget(self.password_input, 1, 1)
+        layout.addWidget(self.login_button, 2, 0, 1, 2)
+        layout.addWidget(self.message_label, 3, 0, 1, 2)
+        
+        # --- 시그널 연결 정리 ---
+        self.login_button.clicked.connect(self._handle_login)
+        # 초기에는 비밀번호 입력창에서만 엔터 키가 동작하도록 연결
+        self.password_input.returnPressed.connect(self._handle_login)
+
+    def _handle_login(self):
+        if self.auth_stage == 0: self._verify_password()
+        elif self.auth_stage == 1: self._verify_otp()
+        elif self.auth_stage == 2: self._verify_email_code()
+
+    def _verify_password(self):
+        correct_id = "goldenfugu21"
+        self.user_email = "0tlswogur@gmail.com"
+        correct_password_hash = b'\xfe\xa4\x1d\xd1\xfd\xb4^l\xadC\xf8A\xc6\xaa\xa7x`|\x8f\x1akd\x855E\x92\xb1|JO*\x80\r_Yz\xdbt\x9cF\x89N\x08A\xc2\x13\x0f\xbd[f\x1b|\x06\rm\xe8\x11\xc3\xf2]H\r\x0b\x1d'
+        
+        if self.id_input.text() == correct_id and verify_password(correct_password_hash, self.password_input.text()):
+            self._switch_to_otp_stage()
+        else:
+            self.message_label.setStyleSheet("color: red;")
+            self.message_label.setText("아이디 또는 비밀번호가 틀렸습니다.")
+
+    def _switch_to_otp_stage(self):
+        self.auth_stage = 1
+        self.setWindowTitle("OTP 인증")
+        self.id_label.setText("OTP 코드:")
+        self.id_input.clear()
+        self.id_input.setPlaceholderText("6자리 코드를 입력하세요")
+        self.pw_label.hide()
+        self.password_input.hide()
+        self.login_button.setText("다음")
+        self.message_label.setText("")
+        self.id_input.setFocus()
+
+        # --- 엔터 키 시그널 재설정 ---
+        self.password_input.returnPressed.disconnect()
+        self.id_input.returnPressed.connect(self._handle_login)
+
+    def _verify_otp(self):
+        if not self.id_input.text(): return
+        secret_key = "GOZTUG45MBOGODWSBTEC55O7WV7S2DYW"
+        totp = pyotp.TOTP(secret_key)
+        if totp.verify(self.id_input.text()):
+            self.message_label.setStyleSheet("color: black;")
+            self.message_label.setText("이메일을 발송 중입니다...")
+            QApplication.processEvents()
+            self.sent_email_code = send_verification_email(self.user_email)
+            if self.sent_email_code:
+                self._switch_to_email_stage()
+            else:
+                self.message_label.setStyleSheet("color: red;")
+                self.message_label.setText("이메일 발송에 실패했습니다.")
+        else:
+            self.message_label.setStyleSheet("color: red;")
+            self.message_label.setText("OTP 코드가 올바르지 않습니다.")
+
+    def _switch_to_email_stage(self):
+        self.auth_stage = 2
+        self.setWindowTitle("이메일 인증")
+        self.id_label.setText("인증번호:")
+        self.id_input.clear()
+        self.id_input.setPlaceholderText("이메일로 받은 6자리 숫자")
+        self.login_button.setText("로그인")
+        self.message_label.setStyleSheet("color: black;")
+        self.message_label.setText(f"이메일로 인증번호를 보냈습니다.")
+        self.id_input.setFocus()
+
+    def _verify_email_code(self):
+        if not self.id_input.text(): return
+        if self.id_input.text() == self.sent_email_code:
+            try:
+                self.message_label.setStyleSheet("color: black;")
+                self.message_label.setText("API 키 복호화 및 연결 시도 중...")
+                QApplication.processEvents()
+                enc_api_key = os.environ.get('ENC_BINANCE_API_KEY')
+                enc_secret_key = os.environ.get('ENC_BINANCE_SECRET_KEY')
+                if not enc_api_key or not enc_secret_key:
+                    raise ValueError("환경 변수에서 API 키를 찾을 수 없습니다.")
+                password = self.password_input.text()
+                api_key = decrypt_data(enc_api_key.encode(), password)
+                secret_key = decrypt_data(enc_secret_key.encode(), password)
+                client = Client(api_key, secret_key)
+                client.futures_ping()
+                self.client = client
+                self.accept()
+            except Exception as e:
+                logging.error(f"API 키 복호화 또는 연결 실패: {e}")
+                self.message_label.setStyleSheet("color: red;")
+                self.message_label.setText("API 키 복호화 또는 연결에 실패했습니다.")
+        else:
+            self.message_label.setStyleSheet("color: red;")
+            self.message_label.setText("인증번호가 올바르지 않습니다.")
+
+
 # --- 커스텀 라벨 클래스 ---
 class ClickablePriceLabel(QLabel):
     clicked = pyqtSignal(str)
-
     def __init__(self, text, color, parent=None):
         super().__init__(text, parent)
         self.color = color
@@ -190,7 +303,6 @@ class ClickablePriceLabel(QLabel):
             }}
             QLabel:hover {{ background-color: #F0F0F0; }}
         """)
-
     def mousePressEvent(self, event):
         self.clicked.emit(self.text())
 
@@ -199,17 +311,14 @@ class ClickablePriceLabel(QLabel):
 class BinanceWorker(QObject):
     data_received = pyqtSignal(dict)
     connection_error = pyqtSignal(str)
-
     def __init__(self, symbol, websocket_uri):
         super().__init__()
         self.symbol = symbol.lower()
         self.running = False
         self.websocket_uri = f"{websocket_uri}/{self.symbol}@depth5@100ms"
-
     def run(self):
         self.running = True
         asyncio.run(self.connect_and_listen())
-
     async def connect_and_listen(self):
         try:
             async with websockets.connect(self.websocket_uri) as websocket:
@@ -226,7 +335,6 @@ class BinanceWorker(QObject):
         except Exception as e:
             self.connection_error.emit(f"WebSocket 연결 실패: {e}")
             logging.error(f"WebSocket 연결 실패: {e}", exc_info=True)
-
     def stop(self):
         self.running = False
 
@@ -245,27 +353,31 @@ def calculate_target_price(
 
 # --- GUI 애플리케이션 클래스 ---
 class BinanceCalculatorApp(QWidget):
-    def __init__(self):
+    def __init__(self, client): # <<< client를 인자로 받도록 수정
         super().__init__()
 
-        self.config = configparser.ConfigParser()
-        if not self.config.read('config.ini', encoding='utf-8'):
-            logging.error("config.ini 파일을 읽을 수 없습니다. 기본 설정이 필요합니다.")
-
-        self.setWindowTitle("Binance Station Alpha V1.0 (Live landscape Mode)")
+        self.client = client # <<< 전달받은 client 객체 사용
         
+        self.config = configparser.ConfigParser()
+        # ... (config.ini 읽는 부분은 동일) ...
+
+        config_path = os.path.join(BASE_DIR, 'config.ini')
+        if not self.config.read(config_path, encoding='utf-8'):
+            logging.error(f"{config_path} 파일을 읽을 수 없습니다. 기본 설정이 필요합니다.")
+
+        self.setWindowTitle("Binance Station Alpha v1.0")
         self.resize(820, 640) 
         self.center()
 
-        try:
-            self.client = Client(config.API_KEY, config.SECRET_KEY)
-            self.client.API_URL = self.config.get('API', 'api_url')
-            self.client.futures_ping()
-            logging.info("바이낸스 실제 서버 클라이언트 초기화 성공.")
-        except Exception as e:
-            logging.critical(f"API 연결 실패: {e}", exc_info=True)
-            QMessageBox.critical(self, "API 연결 실패", f"API 키 또는 연결을 확인해주세요.\n오류: {e}")
-            QCoreApplication.quit()
+        #try:
+        #    self.client = Client(config.API_KEY, config.SECRET_KEY)
+        #    self.client.API_URL = self.config.get('API', 'api_url')
+        #    self.client.futures_ping()
+        #    logging.info("바이낸스 실제 서버 클라이언트 초기화 성공.")
+        #except Exception as e:
+        #    logging.critical(f"API 연결 실패: {e}", exc_info=True)
+        #    QMessageBox.critical(self, "API 연결 실패", f"API 키 또는 연결을 확인해주세요.\n오류: {e}")
+        #    QCoreApplication.quit()
             
         self.current_selected_symbol = self.config.get('TRADING', 'default_symbol')
         self.position_type = None
@@ -284,7 +396,7 @@ class BinanceCalculatorApp(QWidget):
         self.calculated_ntp_decimal = None
         
         try:
-             self.shortcuts = load_shortcuts()
+             self.shortcuts = load_shortcuts(filename=os.path.join(BASE_DIR, 'shortcuts.json'))
         except Exception as e:
              logging.error(f"shortcuts.json 파일 로드 실패: {e}")
              self.shortcuts = {} 
@@ -646,7 +758,22 @@ class BinanceCalculatorApp(QWidget):
         grid.setRowStretch(1, 1)
         grid.setRowStretch(2, 2)
         grid.setRowStretch(3, 1) 
-        grid.setRowStretch(4, 1) 
+        grid.setRowStretch(4, 1)
+        
+        self.log_display_group = QGroupBox("실시간 로그")
+        log_layout = QVBoxLayout()
+        self.log_display = QTextEdit(self)
+        self.log_display.setReadOnly(True)
+        self.log_display.setFont(QFont("Consolas", 9))
+        log_layout.addWidget(self.log_display)
+        self.log_display_group.setLayout(log_layout)
+        self.log_display_group.hide()
+        grid.addWidget(self.log_display_group, 5, 0, 1, 3)
+        grid.setRowStretch(5, 0)
+
+        self.toggle_log_button = QPushButton("로그 보기", self)
+        self.toggle_log_button.clicked.connect(self.toggle_log_view)
+        asset_main_layout.addWidget(self.toggle_log_button)
         
         self.update_button_style()
         self.calculate_and_display_target()
@@ -716,7 +843,6 @@ class BinanceCalculatorApp(QWidget):
                 label.setText("N/A")
 
     def start_worker(self):
-        # 이 함수를 호출한 신호 소스(sender)가 QThread일 경우에만 연결을 해제합니다.
         sender = self.sender()
         if sender and isinstance(sender, QThread):
             sender.finished.disconnect(self.start_worker)
@@ -924,7 +1050,7 @@ class BinanceCalculatorApp(QWidget):
             for asset in account_info['assets']:
                 if asset['asset'] == 'USDT':
                     self.available_balance = Decimal(asset['availableBalance'])
-                    self.balance_label.setText(f"사용 가능: ${self.available_balance:,.2f}")
+                    self.balance_label.setText(f"사용 가능(테스트): ${self.available_balance:,.2f}")
                     return
         except Exception as e:
             logging.error(f"자산 정보 로드 실패: {e}", exc_info=True)
@@ -1142,6 +1268,25 @@ class BinanceCalculatorApp(QWidget):
         else:
             self.long_button.setStyleSheet(default_style)
             self.short_button.setStyleSheet(default_style)
+    
+    def toggle_log_view(self):
+        if self.log_display_group.isVisible():
+            self.log_display_group.hide()
+            self.toggle_log_button.setText("로그 보기")
+            self.layout().setRowStretch(5, 0)
+        else:
+            self.load_log_content()
+            self.log_display_group.show()
+            self.toggle_log_button.setText("로그 숨기기")
+            self.layout().setRowStretch(5, 1)
+
+    def load_log_content(self):
+        try:
+            with open('trading_app.log', 'r', encoding='utf-8') as f:
+                self.log_display.setText(f.read())
+            self.log_display.verticalScrollBar().setValue(self.log_display.verticalScrollBar().maximum())
+        except Exception as e:
+            self.log_display.setText(f"로그 파일을 읽는 데 실패했습니다: {e}")
 
     def calculate_and_display_target(self):
         try:
@@ -1194,17 +1339,22 @@ class BinanceCalculatorApp(QWidget):
             self.target_price_label.setText("Target Price: N/A")
             self.price_change_label.setText("NLV: N/A")
 
-def _start_main_app(app, splash_manager):
+# blc17.py 하단
+def _start_main_app(app, splash_manager, player, client): # client 인자 추가
     try:
-        ex = BinanceCalculatorApp()
-        splash_manager.hide_splash(main_window=ex, duration_ms=500) 
-        QTimer.singleShot(500, lambda: _show_main_window(ex))
+        ex = BinanceCalculatorApp(client) # 생성자에 client 전달
+        splash_manager.hide_splash(main_window=ex, duration_ms=1000) 
+        QTimer.singleShot(1000, lambda: _show_main_window(ex, player))
     except Exception as e:
         logging.critical("메인 앱 초기화 중 치명적인 오류 발생.", exc_info=True)
+        player.stop()
         QCoreApplication.quit()
 
-def _show_main_window(main_window):
+
+def _show_main_window(main_window, player): # player 인자 추가
+    """스플래시가 완전히 닫힌 후 메인 창을 띄우고 음악을 멈춥니다."""
     main_window.show()
+    player.stop() # 메인 창이 뜨면 음악 정지
     logging.info("애플리케이션 시작.")
 
 if __name__ == "__main__":
@@ -1215,12 +1365,35 @@ if __name__ == "__main__":
     if not os.path.exists('shortcuts.json'):
         create_default_shortcuts()
     
-    try:
-        app = QApplication(sys.argv)
+    app = QApplication(sys.argv)
+    app.setWindowIcon(QIcon(os.path.join(BASE_DIR, 'favicon.ico')))
+    
+    login = LoginDialog()
+    
+    if login.exec_() == QDialog.Accepted:
+        client = login.client # 로그인 성공 후 생성된 client 객체를 가져옴
+
+        player = QMediaPlayer()
+        
+        # 2. 음악 파일 경로 설정 (BASE_DIR 사용)
+        file_path = os.path.join(BASE_DIR, 'login_sound.mp3')
+        url = QUrl.fromLocalFile(file_path)
+        content = QMediaContent(url)
+        
+        # 3. 플레이어에 음악 로드 및 볼륨 설정
+        player.setMedia(content)
+        player.setVolume(50) # 0~100 사이 값으로 볼륨 조절
+
+        # 4. 스플래시 화면 띄우기
         splash_manager = SplashManager(image_path="splash_boot.png") 
         splash_manager.show_splash()
-        QTimer.singleShot(500, lambda: _start_main_app(app, splash_manager)) 
-        sys.exit(app.exec_()) 
-    except Exception as e:
-        logging.critical("애플리케이션 실행 중 치명적인 오류 발생.", exc_info=True)
-        sys.exit(1)
+
+        # 5. 음악 재생
+        player.play()
+        
+        # _start_main_app 함수에 client 객체 전달
+        QTimer.singleShot(8200, lambda: _start_main_app(app, splash_manager, player, client)) 
+        
+        sys.exit(app.exec_())
+    else:
+        sys.exit(0)

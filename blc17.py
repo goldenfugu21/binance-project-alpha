@@ -13,7 +13,7 @@ from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QComboBox, QMessageBox, QGroupBox, QTextEdit,
     QRadioButton, QSlider, QGridLayout, QSplashScreen, 
-    QDesktopWidget, QShortcut 
+    QDesktopWidget, QShortcut, QDialog
 )
 from PyQt5.QtGui import QFont, QDoubleValidator, QCursor, QPixmap, QKeySequence 
 from PyQt5.QtCore import (
@@ -443,7 +443,7 @@ class BinanceCalculatorApp(QWidget):
         self.open_orders_display.setFont(QFont("Consolas", 10))
         self.open_orders_display.setText("미체결 주문 없음")
         open_orders_layout.addWidget(self.open_orders_display)
-        self.cancel_all_orders_button = QPushButton(f"미체결 전체 취소", self)
+        self.cancel_all_orders_button = QPushButton(f"{self.current_selected_symbol} 미체결 전체 취소", self)
         self.cancel_all_orders_button.setFont(button_font)
         self.cancel_all_orders_button.setStyleSheet("background-color: #212529; color: white; padding: 6px; font-weight: bold;")
         self.cancel_all_orders_button.clicked.connect(self.cancel_all_open_orders)
@@ -646,7 +646,24 @@ class BinanceCalculatorApp(QWidget):
         grid.setRowStretch(1, 1)
         grid.setRowStretch(2, 2)
         grid.setRowStretch(3, 1) 
-        grid.setRowStretch(4, 1) 
+        grid.setRowStretch(4, 1)
+        
+        # --- 로그 보기 기능 추가 ---
+        self.log_display_group = QGroupBox("실시간 로그")
+        log_layout = QVBoxLayout()
+        self.log_display = QTextEdit(self)
+        self.log_display.setReadOnly(True)
+        self.log_display.setFont(QFont("Consolas", 9))
+        log_layout.addWidget(self.log_display)
+        self.log_display_group.setLayout(log_layout)
+        self.log_display_group.hide()
+        grid.addWidget(self.log_display_group, 5, 0, 1, 3)
+        grid.setRowStretch(5, 0)
+
+        self.toggle_log_button = QPushButton("로그 보기", self)
+        self.toggle_log_button.clicked.connect(self.toggle_log_view)
+        asset_main_layout.addWidget(self.toggle_log_button)
+        # --- 로그 보기 기능 추가 끝 ---
         
         self.update_button_style()
         self.calculate_and_display_target()
@@ -716,7 +733,6 @@ class BinanceCalculatorApp(QWidget):
                 label.setText("N/A")
 
     def start_worker(self):
-        # 이 함수를 호출한 신호 소스(sender)가 QThread일 경우에만 연결을 해제합니다.
         sender = self.sender()
         if sender and isinstance(sender, QThread):
             sender.finished.disconnect(self.start_worker)
@@ -1142,6 +1158,25 @@ class BinanceCalculatorApp(QWidget):
         else:
             self.long_button.setStyleSheet(default_style)
             self.short_button.setStyleSheet(default_style)
+    
+    def toggle_log_view(self):
+        if self.log_display_group.isVisible():
+            self.log_display_group.hide()
+            self.toggle_log_button.setText("로그 보기")
+            self.layout().setRowStretch(5, 0)
+        else:
+            self.load_log_content()
+            self.log_display_group.show()
+            self.toggle_log_button.setText("로그 숨기기")
+            self.layout().setRowStretch(5, 1)
+
+    def load_log_content(self):
+        try:
+            with open('trading_app.log', 'r', encoding='utf-8') as f:
+                self.log_display.setText(f.read())
+            self.log_display.verticalScrollBar().setValue(self.log_display.verticalScrollBar().maximum())
+        except Exception as e:
+            self.log_display.setText(f"로그 파일을 읽는 데 실패했습니다: {e}")
 
     def calculate_and_display_target(self):
         try:
